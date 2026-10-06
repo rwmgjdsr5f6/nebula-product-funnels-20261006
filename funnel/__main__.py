@@ -17,7 +17,9 @@ from datetime import datetime
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 VALID_EVENTS = ("visit", "signup")
-WITHIN_SECONDS_RE = re.compile(r"^[0-9]+$")
+# 严格锚定到完整参数值的首尾：必须使用 \A/\Z 而不是 ^/$——Python 正则中
+# 的 $ 可匹配末尾 LF 之前的位置，^[0-9]+$ 会把 "60\n" 误判为合法值。
+WITHIN_SECONDS_RE = re.compile(r"\A[0-9]+\Z")
 
 # SQLite INTEGER 的上限。合法时间戳（公元 1 至 9999 年）之间的最大间隔约
 # 3.2e11 秒，远小于该上限，因此把窗口钳制到此值不会改变任何统计结果，

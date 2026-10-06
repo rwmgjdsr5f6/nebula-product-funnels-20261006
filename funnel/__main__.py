@@ -2,6 +2,8 @@
 
     python -m funnel import <events.jsonl> --db <events.sqlite>
     python -m funnel report --db <events.sqlite> [--within-seconds N]
+                              [--visit-from YYYY-MM-DDTHH:MM:SS
+                               --visit-before YYYY-MM-DDTHH:MM:SS]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -16,6 +18,9 @@ from datetime import datetime
 
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
+# 报告时间段参数专用：严格锚定首尾，前后空白与末尾 LF 都不接受
+# （TIMESTAMP_RE 的 $ 可匹配末尾 LF 之前的位置，不能直接复用）。
+VISIT_BOUND_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\Z")
 VALID_EVENTS = ("visit", "signup")
 # 严格锚定到完整参数值的首尾：必须使用 \A/\Z 而不是 ^/$——Python 正则中
 # 的 $ 可匹配末尾 LF 之前的位置，^[0-9]+$ 会把 "60\n" 误判为合法值。
@@ -160,7 +165,88 @@ def parse_within_seconds(text):
     return int(digits)
 
 
+def _visit_window_clause(args):
+    """段内 visit 过滤片段；不提供时间段时为空（全库统计）。"""
+    if args.visit_from is None:
+        return ""
+    return "AND v.timestamp >= ? AND v.timestamp < ?"
+
+
+def _converted_sql(args):
+    """转化人数查询：visit 必须在段内（如有），signup 只要求严格晚于该次
+    visit，signup 自身可以晚于段终点。"""
+    sql = [
+        "SELECT COUNT(DISTINCT v.user_id)",
+        "FROM events v",
+        "JOIN events s",
+        "  ON s.user_id = v.user_id",
+        " AND s.event = 'signup'",
+        " AND s.timestamp > v.timestamp",
+    ]
+    if args.within_seconds is not None:
+        # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒
+        sql.append(
+            " AND CAST(strftime('%s', s.timestamp) AS INTEGER)"
+            "\n                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?"
+        )
+    sql.append("WHERE v.event = 'visit'")
+    sql.append(_visit_window_clause(args))
+    return "\n".join(sql)
+
+
+def _converted_params(args):
+    params = []
+    if args.within_seconds is not None:
+        params.append(args.within_seconds)
+    if args.visit_from is not None:
+        params += [args.visit_from, args.visit_before]
+    return tuple(params)
+
+
+def parse_visit_bound(text):
+    """--visit-from / --visit-before 取值校验。
+
+    只接受恰好 YYYY-MM-DDTHH:MM:SS 形态的有效日历时间（统一视为 UTC）：
+    不接受前后空白、时区后缀或小数秒；正则只保证形态，strptime 再排除
+    2026-02-30 这类形态合法但日历无效的日期。校验失败经 argparse 以退出
+    码 2 拒绝（标准错误自带参数名前缀），且先于一切数据库访问发生。
+    """
+    if not VISIT_BOUND_RE.match(text):
+        raise argparse.ArgumentTypeError(
+            "必须是 YYYY-MM-DDTHH:MM:SS 格式（UTC，不含空白、时区后缀或小数秒），得到 %r"
+            % text
+        )
+    try:
+        datetime.strptime(text, TIMESTAMP_FORMAT)
+    except ValueError:
+        raise argparse.ArgumentTypeError("不是有效时间: %r" % text)
+    return text
+
+
 def cmd_report(args):
+    # 时间段参数必须成对出现且起点严格早于终点。参数校验先于数据库访问：
+    # 任何一项不合法都直接退出码 2，不创建数据库、不改动记录。
+    if (args.visit_from is None) != (args.visit_before is None):
+        missing = "--visit-before" if args.visit_from is not None else "--visit-from"
+        present = "--visit-from" if missing == "--visit-before" else "--visit-before"
+        print(
+            "%s 与 %s 必须成对使用：已提供 %s，缺少 %s"
+            % ("--visit-from", "--visit-before", present, missing),
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        args.visit_from is not None
+        and args.visit_from >= args.visit_before
+    ):
+        # 时间戳为定宽 ISO 文本，字典序比较与时间先后比较等价。
+        print(
+            "--visit-from 必须严格早于 --visit-before：得到 --visit-from %r、--visit-before %r"
+            % (args.visit_from, args.visit_before),
+            file=sys.stderr,
+        )
+        return 2
+
     if not os.path.exists(args.db):
         print("%s: 数据库不存在" % args.db, file=sys.stderr)
         return 2
@@ -169,37 +255,23 @@ def cmd_report(args):
         conn = sqlite3.connect(args.db)
         try:
             conn.execute(SCHEMA)
-            visit_users = conn.execute(
-                "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = 'visit'"
-            ).fetchone()[0]
-            if args.within_seconds is None:
-                converted_users = conn.execute(
-                    """
-                    SELECT COUNT(DISTINCT v.user_id)
-                    FROM events v
-                    JOIN events s
-                      ON s.user_id = v.user_id
-                     AND s.event = 'signup'
-                     AND s.timestamp > v.timestamp
-                    WHERE v.event = 'visit'
-                    """
+            if args.visit_from is None:
+                visit_users = conn.execute(
+                    "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = 'visit'"
                 ).fetchone()[0]
             else:
-                # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒
-                converted_users = conn.execute(
+                # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
+                # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
+                visit_users = conn.execute(
                     """
-                    SELECT COUNT(DISTINCT v.user_id)
-                    FROM events v
-                    JOIN events s
-                      ON s.user_id = v.user_id
-                     AND s.event = 'signup'
-                     AND s.timestamp > v.timestamp
-                     AND CAST(strftime('%s', s.timestamp) AS INTEGER)
-                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?
-                    WHERE v.event = 'visit'
+                    SELECT COUNT(DISTINCT user_id) FROM events
+                    WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?
                     """,
-                    (args.within_seconds,),
+                    (args.visit_from, args.visit_before),
                 ).fetchone()[0]
+            converted_users = conn.execute(
+                _converted_sql(args), _converted_params(args)
+            ).fetchone()[0]
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -239,6 +311,20 @@ def main(argv=None):
         default=None,
         metavar="N",
         help="只统计访问后 N 秒内完成的注册（正整数秒，允许前导零）；不传则不限间隔",
+    )
+    p_report.add_argument(
+        "--visit-from",
+        type=parse_visit_bound,
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM:SS",
+        help="只统计该起点（含）之后发生访问的用户；UTC，必须与 --visit-before 成对使用",
+    )
+    p_report.add_argument(
+        "--visit-before",
+        type=parse_visit_bound,
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM:SS",
+        help="只统计该终点（不含）之前发生访问的用户；UTC，必须与 --visit-from 成对使用",
     )
     p_report.set_defaults(func=cmd_report)
 

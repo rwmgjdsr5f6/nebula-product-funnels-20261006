@@ -1,0 +1,5 @@
+{"user_id": "u1", "event": "visit", "timestamp": "2026-10-06T10:00:00"}
+{"user_id": "u1", "event": "signup", "timestamp": "2026-10-06T11:00:00"}
+{"user_id": "u2", "event": "visit", "timestamp": "2026-10-06T10:00:00"}
+{"user_id": "u3", "event": "signup", "timestamp": "2026-10-06T09:00:00"}
+{"user_id": "u3", "event": "visit", "timestamp": "2026-10-06T10:00:00"}

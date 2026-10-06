@@ -16,6 +16,14 @@ python -m funnel import sample.jsonl --db events.sqlite
 python -m funnel report --db events.sqlite
 ```
 
+可选参数 `--within-seconds N` 只统计访问后 N 秒内（含恰好 N 秒）完成注册的转化，仅影响本次报告，不过滤访问人数、不修改记录：
+
+```sh
+python -m funnel report --db events.sqlite --within-seconds 60
+```
+
+`N` 必须是仅由 ASCII 数字组成且大于零的整数（允许前导零）；缺少值、零、负数、小数或其他非数字内容均以退出码 2 失败，标准输出为空，标准错误指出 `--within-seconds` 及无效原因，且不创建数据库、不修改已有记录。
+
 ## 事件格式
 
 UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
@@ -36,6 +44,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 
 - 访问人数：发生过 `visit` 的用户去重计数
 - 转化人数：存在严格晚于某次 `visit` 的 `signup` 的用户去重计数（相等时刻不算转化）
+- 指定 `--within-seconds N` 时，转化还要求某一对 visit/signup 的间隔不超过 N 秒（恰好 N 秒计入）；同一用户多次访问中任意一次满足即可
 - 统计不依赖行序，不限定事件间隔；重复事件与重复导入不增加人数
 - 转化比例 = 转化人数 / 访问人数；零访问时三项均为 0
 

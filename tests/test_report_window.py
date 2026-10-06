@@ -56,6 +56,22 @@ SIGNUP_ONLY_EVENTS = [
     {"user_id": "u6", "event": "signup", "timestamp": "2026-10-06T10:00:30"},
 ]
 
+# 验收样例：2026-10-06 的五条事件。
+# u1：10:00:00 visit，10:01:00 signup（间隔 60 秒）
+# u2：只有 10:00:00 visit
+# u3：09:59:00 signup，10:00:00 visit（signup 早于 visit，任何窗口都不转化）
+ACCEPTANCE_EVENTS = [
+    {"user_id": "u1", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u1", "event": "signup", "timestamp": "2026-10-06T10:01:00"},
+    {"user_id": "u2", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u3", "event": "signup", "timestamp": "2026-10-06T09:59:00"},
+    {"user_id": "u3", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+]
+
+# 超过 SQLite INTEGER 上限（2**63 - 1）的合法大窗口：参数不设数值或位数上限。
+HUGE_WITHIN_SECONDS = "9223372036854775808"  # 2**63
+HUGE_WITHIN_SECONDS_LONG = "9" * 5000  # 5000 个字符 9
+
 # 非法 --within-seconds 取值：0、负数、小数、带单位、全角数字。
 INVALID_WITHIN_SECONDS = ["0", "-1", "1.5", "60s", "６０"]
 
@@ -178,6 +194,66 @@ class FunnelReportTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, msg=second.stderr)
         self.assertReportMetrics(self.report(db, 60), 5, 2, 0.4)
         self.assertReportMetrics(self.report(db), 5, 3, 0.6)
+
+    # -- 大窗口：超过 SQLite INTEGER 上限的 N 也正常出报告 ----------------
+
+    def test_acceptance_import_five_events(self):
+        path = self.write_jsonl("acceptance.jsonl", ACCEPTANCE_EVENTS)
+        db = self.db_path()
+        result = run_funnel("import", path, "--db", db)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {"imported": 5})
+
+    def test_huge_window_above_sqlite_integer_max(self):
+        db = self.import_events(ACCEPTANCE_EVENTS, jsonl_name="acceptance.jsonl")
+        # 2**63：仅 u1 转化；u3 的 signup 早于 visit，再大窗口也不算。
+        self.assertReportMetrics(
+            self.report(db, HUGE_WITHIN_SECONDS), 3, 1, 0.3333333333333333
+        )
+
+    def test_huge_window_5000_nines(self):
+        db = self.import_events(ACCEPTANCE_EVENTS, jsonl_name="acceptance.jsonl")
+        # 5000 个字符 9：位数不设上限，结果与 60 秒窗口一致。
+        self.assertReportMetrics(
+            self.report(db, HUGE_WITHIN_SECONDS_LONG), 3, 1, 0.3333333333333333
+        )
+
+    def test_acceptance_leading_zero_window(self):
+        db = self.import_events(ACCEPTANCE_EVENTS, jsonl_name="acceptance.jsonl")
+        self.assertReportMetrics(self.report(db, "00060"), 3, 1, 0.3333333333333333)
+
+    def test_acceptance_window_59_seconds(self):
+        db = self.import_events(ACCEPTANCE_EVENTS, jsonl_name="acceptance.jsonl")
+        # u1 间隔 60 秒超出 59 秒窗口：访问 3 人、转化 0 人、比例 0。
+        self.assertReportMetrics(self.report(db, 59), 3, 0, 0)
+
+    def test_huge_window_matches_unbounded_report(self):
+        db = self.import_events(MAIN_EVENTS)
+        # 大窗口等价于不限间隔：u1、u2、u5 转化，u3 逆序、u4 同时刻均不计。
+        self.assertReportMetrics(self.report(db, HUGE_WITHIN_SECONDS), 5, 3, 0.6)
+        self.assertReportMetrics(self.report(db, HUGE_WITHIN_SECONDS_LONG), 5, 3, 0.6)
+
+    def test_huge_window_signup_only_db_reports_all_zero(self):
+        db = self.import_events(SIGNUP_ONLY_EVENTS, jsonl_name="signup_only.jsonl")
+        self.assertReportMetrics(self.report(db, HUGE_WITHIN_SECONDS), 0, 0, 0)
+
+    def test_huge_window_missing_db_follows_path_error_protocol(self):
+        db = self.db_path("missing-huge.sqlite")
+        self.assertFalse(os.path.exists(db))
+        result = self.report(db, HUGE_WITHIN_SECONDS)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(db, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(db))
+
+    def test_huge_window_keeps_events_unchanged(self):
+        db = self.import_events(MAIN_EVENTS)
+        before = self.snapshot_events(db)
+        self.report(db, HUGE_WITHIN_SECONDS)
+        self.report(db, HUGE_WITHIN_SECONDS_LONG)
+        self.assertEqual(self.snapshot_events(db), before)
 
     # -- 报告确定输出 -----------------------------------------------------
 

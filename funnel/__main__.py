@@ -19,6 +19,11 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 VALID_EVENTS = ("visit", "signup")
 WITHIN_SECONDS_RE = re.compile(r"^[0-9]+$")
 
+# SQLite INTEGER 的上限。合法时间戳（公元 1 至 9999 年）之间的最大间隔约
+# 3.2e11 秒，远小于该上限，因此把窗口钳制到此值不会改变任何统计结果，
+# 同时避免绑定超大 Python 整数时触发 OverflowError。
+MAX_SQLITE_INTEGER = 2**63 - 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     user_id   TEXT NOT NULL,
@@ -132,15 +137,25 @@ def cmd_import(args):
 
 
 def parse_within_seconds(text):
-    """--within-seconds 取值校验：仅接受全为 ASCII 数字且大于零的整数（允许前导零）。"""
+    """--within-seconds 取值校验：仅接受全为 ASCII 数字且大于零的整数（允许前导零）。
+
+    数值与位数均不设上限。超过 SQLite INTEGER 上限的窗口等价于不限间隔
+    （合法时间戳之间的间隔不可能达到该量级），统一钳制到该上限返回；
+    比较按去前导零后的十进制字符串进行，不依赖 int() 的位数限制。
+    """
     if not WITHIN_SECONDS_RE.match(text):
         raise argparse.ArgumentTypeError(
             "必须是只含 ASCII 数字的正整数，得到 %r" % text
         )
-    value = int(text)
-    if value <= 0:
+    digits = text.lstrip("0")
+    if not digits:
         raise argparse.ArgumentTypeError("必须大于零，得到 %r" % text)
-    return value
+    max_digits = str(MAX_SQLITE_INTEGER)
+    if len(digits) > len(max_digits) or (
+        len(digits) == len(max_digits) and digits > max_digits
+    ):
+        return MAX_SQLITE_INTEGER
+    return int(digits)
 
 
 def cmd_report(args):

@@ -4,7 +4,7 @@
     python -m funnel report --db <events.sqlite> [--within-seconds N]
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
-                              [--include-users]
+                              [--include-users] [--include-pairs]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -204,6 +204,47 @@ def _converted_params(args):
     return tuple(params)
 
 
+def _conversion_pairs_sql(args):
+    """每个转化用户取一对 (visit, signup) 作为转化依据。
+
+    有效配对条件与 _converted_sql 完全一致：signup 严格晚于 visit、间隔不
+    超过 --within-seconds（含上界）、visit 必须在访问时段内（含起点、不含
+    终点），signup 可以晚于段终点。选取规则分两步：先在该用户的全部有效
+    配对中取时间最早的 signup，再在能与该 signup 有效配对的 visit 中取时
+    间最晚的一次。时间戳为定宽 ISO 文本，MIN/MAX 与字典序比较等价于时间
+    先后比较；去重在 SQL 内完成，重复事件与重复导入不产生多行。
+    """
+    gap_clause = ""
+    if args.within_seconds is not None:
+        gap_clause = (
+            " AND CAST(strftime('%s', s.timestamp) AS INTEGER)"
+            "\n                             - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?"
+        )
+    return """
+WITH pairs AS (
+    SELECT v.user_id AS user_id,
+           v.timestamp AS visit_ts,
+           s.timestamp AS signup_ts
+    FROM events v
+    JOIN events s
+      ON s.user_id = v.user_id
+     AND s.event = 'signup'
+     AND s.timestamp > v.timestamp{gap}
+    WHERE v.event = 'visit'{window}
+),
+first_signup AS (
+    SELECT user_id, MIN(signup_ts) AS signup_ts
+    FROM pairs
+    GROUP BY user_id
+)
+SELECT p.user_id, p.signup_ts, MAX(p.visit_ts)
+FROM pairs p
+JOIN first_signup f
+  ON f.user_id = p.user_id AND f.signup_ts = p.signup_ts
+GROUP BY p.user_id, p.signup_ts
+""".format(gap=gap_clause, window=_visit_window_clause(args))
+
+
 def parse_visit_bound(text):
     """--visit-from / --visit-before 取值校验。
 
@@ -291,6 +332,12 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
+            if args.include_pairs:
+                # 配对依据沿用与汇总完全相同的筛选条件；每用户至多一对，
+                # 去重与最早 signup / 最晚 visit 的选取都在 SQL 内完成。
+                pair_rows = conn.execute(
+                    _conversion_pairs_sql(args), _converted_params(args)
+                ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -306,6 +353,18 @@ def cmd_report(args):
     if args.include_users:
         payload["visit_user_ids"] = visit_user_ids
         payload["converted_user_ids"] = converted_user_ids
+    if args.include_pairs:
+        # 按 user_id 原值的 Unicode 码点字典序升序：str 比较即码点序，
+        # 区分大小写、保留空白与中文、不按数字大小排序。
+        conversion_pairs = [
+            {
+                "user_id": user_id,
+                "visit_timestamp": visit_ts,
+                "signup_timestamp": signup_ts,
+            }
+            for user_id, signup_ts, visit_ts in sorted(pair_rows, key=lambda r: r[0])
+        ]
+        payload["conversion_pairs"] = conversion_pairs
     print(json.dumps(payload))
     return 0
 
@@ -350,6 +409,12 @@ def main(argv=None):
         action="store_true",
         help="在汇总之外追加 visit_user_ids 与 converted_user_ids 两个编号数组"
         "（按 user_id 原值去重，按 Unicode 码点升序），不改变汇总数值",
+    )
+    p_report.add_argument(
+        "--include-pairs",
+        action="store_true",
+        help="在汇总之外追加 conversion_pairs 配对明细：每个转化用户至多一对，"
+        "取最早有效 signup 与可与之配对的最晚 visit，按 user_id 的 Unicode 码点升序",
     )
     p_report.set_defaults(func=cmd_report)
 

@@ -1,7 +1,7 @@
 """命令行入口：
 
     python -m funnel import <events.jsonl> --db <events.sqlite>
-    python -m funnel report --db <events.sqlite>
+    python -m funnel report --db <events.sqlite> [--within-seconds N]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -17,6 +17,7 @@ from datetime import datetime
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 VALID_EVENTS = ("visit", "signup")
+WITHIN_SECONDS_RE = re.compile(r"^[0-9]+$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -118,6 +119,18 @@ def cmd_import(args):
     return 0
 
 
+def parse_within_seconds(text):
+    """--within-seconds 取值校验：仅接受全为 ASCII 数字且大于零的整数（允许前导零）。"""
+    if not WITHIN_SECONDS_RE.match(text):
+        raise argparse.ArgumentTypeError(
+            "必须是只含 ASCII 数字的正整数，得到 %r" % text
+        )
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("必须大于零，得到 %r" % text)
+    return value
+
+
 def cmd_report(args):
     if not os.path.exists(args.db):
         print("%s: 数据库不存在" % args.db, file=sys.stderr)
@@ -130,17 +143,34 @@ def cmd_report(args):
             visit_users = conn.execute(
                 "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = 'visit'"
             ).fetchone()[0]
-            converted_users = conn.execute(
-                """
-                SELECT COUNT(DISTINCT v.user_id)
-                FROM events v
-                JOIN events s
-                  ON s.user_id = v.user_id
-                 AND s.event = 'signup'
-                 AND s.timestamp > v.timestamp
-                WHERE v.event = 'visit'
-                """
-            ).fetchone()[0]
+            if args.within_seconds is None:
+                converted_users = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT v.user_id)
+                    FROM events v
+                    JOIN events s
+                      ON s.user_id = v.user_id
+                     AND s.event = 'signup'
+                     AND s.timestamp > v.timestamp
+                    WHERE v.event = 'visit'
+                    """
+                ).fetchone()[0]
+            else:
+                # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒
+                converted_users = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT v.user_id)
+                    FROM events v
+                    JOIN events s
+                      ON s.user_id = v.user_id
+                     AND s.event = 'signup'
+                     AND s.timestamp > v.timestamp
+                     AND CAST(strftime('%s', s.timestamp) AS INTEGER)
+                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?
+                    WHERE v.event = 'visit'
+                    """,
+                    (args.within_seconds,),
+                ).fetchone()[0]
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -174,6 +204,13 @@ def main(argv=None):
 
     p_report = sub.add_parser("report", help="统计全库两步漏斗")
     p_report.add_argument("--db", required=True, help="SQLite 数据库路径")
+    p_report.add_argument(
+        "--within-seconds",
+        type=parse_within_seconds,
+        default=None,
+        metavar="N",
+        help="只统计访问后 N 秒内完成的注册（正整数秒，允许前导零）；不传则不限间隔",
+    )
     p_report.set_defaults(func=cmd_report)
 
     args = parser.parse_args(argv)

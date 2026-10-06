@@ -4,7 +4,7 @@
     python -m funnel report --db <events.sqlite> [--within-seconds N]
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
-                              [--include-users]
+                              [--include-users] [--include-pairs]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -291,6 +291,31 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
+            if args.include_pairs:
+                # 明细沿用与汇总完全相同的配对条件（同一 SQL，仅改 select
+                # 列表），在 Python 侧归约：每人先取时间最早的 signup，再
+                # 从能与该注册有效配对的 visit 中取时间最晚的一次。时间戳
+                # 为定宽 ISO 文本，字典序比较与时间先后比较等价；重复事件
+                # 与重复导入产生的相同配对不影响 min/max 结果。
+                best_by_user = {}  # user_id -> [signup_ts, visit_ts]
+                for user_id, visit_ts, signup_ts in conn.execute(
+                    _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
+                    _converted_params(args),
+                ):
+                    current = best_by_user.get(user_id)
+                    if current is None or signup_ts < current[0]:
+                        best_by_user[user_id] = [signup_ts, visit_ts]
+                    elif signup_ts == current[0] and visit_ts > current[1]:
+                        current[1] = visit_ts
+                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序。
+                conversion_pairs = [
+                    {
+                        "user_id": user_id,
+                        "visit_timestamp": best_by_user[user_id][1],
+                        "signup_timestamp": best_by_user[user_id][0],
+                    }
+                    for user_id in sorted(best_by_user)
+                ]
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -306,6 +331,8 @@ def cmd_report(args):
     if args.include_users:
         payload["visit_user_ids"] = visit_user_ids
         payload["converted_user_ids"] = converted_user_ids
+    if args.include_pairs:
+        payload["conversion_pairs"] = conversion_pairs
     print(json.dumps(payload))
     return 0
 
@@ -350,6 +377,13 @@ def main(argv=None):
         action="store_true",
         help="在汇总之外追加 visit_user_ids 与 converted_user_ids 两个编号数组"
         "（按 user_id 原值去重，按 Unicode 码点升序），不改变汇总数值",
+    )
+    p_report.add_argument(
+        "--include-pairs",
+        action="store_true",
+        help="在汇总之外追加 conversion_pairs 配对明细数组"
+        "（每个转化用户一条：最早有效 signup 配对最晚有效 visit，"
+        "按 user_id 原值的 Unicode 码点升序），不改变汇总数值",
     )
     p_report.set_defaults(func=cmd_report)
 

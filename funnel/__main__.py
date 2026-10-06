@@ -81,12 +81,23 @@ def parse_line(text, line_no):
 def load_events(path):
     """读取并校验整个 JSONL 文件；任一行非法则抛出 LineError，不返回部分结果。"""
     events = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line_no, raw in enumerate(fh, start=1):
-            text = raw.strip()
-            if not text:
-                continue  # 空白行忽略，但物理行号照常递增
-            events.append(parse_line(text, line_no))
+    with open(path, "rb") as fh:
+        data = fh.read()
+    # 只按 LF 切分物理行（CRLF 的 \r 随后随首尾空白一并去除），
+    # 末行没有换行符时仍算一行；不用 bytes.splitlines()，
+    # 以免 \v、\x1c 等额外分隔符扰乱物理行号。
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    for line_no, raw in enumerate(lines, start=1):
+        try:
+            text = raw.decode("utf-8")  # 严格解码：不替换字节、不跳过、不回退其他编码
+        except UnicodeDecodeError as exc:
+            raise LineError(line_no, "UTF-8 编码无效: %s" % exc.reason)
+        text = text.strip()
+        if not text:
+            continue  # 空白行忽略，但物理行号照常递增
+        events.append(parse_line(text, line_no))
     return events
 
 

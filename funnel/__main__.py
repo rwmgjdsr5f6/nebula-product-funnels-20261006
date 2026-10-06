@@ -4,6 +4,7 @@
     python -m funnel report --db <events.sqlite> [--within-seconds N]
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
+                              [--include-users]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -172,11 +173,11 @@ def _visit_window_clause(args):
     return "AND v.timestamp >= ? AND v.timestamp < ?"
 
 
-def _converted_sql(args):
-    """转化人数查询：visit 必须在段内（如有），signup 只要求严格晚于该次
-    visit，signup 自身可以晚于段终点。"""
+def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
+    """转化查询：visit 必须在段内（如有），signup 只要求严格晚于该次
+    visit，signup 自身可以晚于段终点。select 决定返回人数还是用户编号。"""
     sql = [
-        "SELECT COUNT(DISTINCT v.user_id)",
+        "SELECT " + select,
         "FROM events v",
         "JOIN events s",
         "  ON s.user_id = v.user_id",
@@ -256,22 +257,40 @@ def cmd_report(args):
         try:
             conn.execute(SCHEMA)
             if args.visit_from is None:
-                visit_users = conn.execute(
-                    "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = 'visit'"
-                ).fetchone()[0]
+                visit_where = "WHERE event = 'visit'"
+                visit_params = ()
             else:
                 # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
                 # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
-                visit_users = conn.execute(
-                    """
-                    SELECT COUNT(DISTINCT user_id) FROM events
-                    WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?
-                    """,
-                    (args.visit_from, args.visit_before),
-                ).fetchone()[0]
+                visit_where = (
+                    "WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?"
+                )
+                visit_params = (args.visit_from, args.visit_before)
+            visit_users = conn.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM events " + visit_where,
+                visit_params,
+            ).fetchone()[0]
             converted_users = conn.execute(
                 _converted_sql(args), _converted_params(args)
             ).fetchone()[0]
+            if args.include_users:
+                # 明细沿用与汇总完全相同的筛选条件，按 user_id 原值去重。
+                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序，
+                # 区分大小写、保留空白与中文、不按数字大小排序。
+                visit_user_ids = sorted(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT DISTINCT user_id FROM events " + visit_where,
+                        visit_params,
+                    )
+                )
+                converted_user_ids = sorted(
+                    row[0]
+                    for row in conn.execute(
+                        _converted_sql(args, "DISTINCT v.user_id"),
+                        _converted_params(args),
+                    )
+                )
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -279,15 +298,15 @@ def cmd_report(args):
         return 2
 
     conversion_rate = converted_users / visit_users if visit_users else 0
-    print(
-        json.dumps(
-            {
-                "visit_users": visit_users,
-                "converted_users": converted_users,
-                "conversion_rate": conversion_rate,
-            }
-        )
-    )
+    payload = {
+        "visit_users": visit_users,
+        "converted_users": converted_users,
+        "conversion_rate": conversion_rate,
+    }
+    if args.include_users:
+        payload["visit_user_ids"] = visit_user_ids
+        payload["converted_user_ids"] = converted_user_ids
+    print(json.dumps(payload))
     return 0
 
 
@@ -325,6 +344,12 @@ def main(argv=None):
         default=None,
         metavar="YYYY-MM-DDTHH:MM:SS",
         help="只统计该终点（不含）之前发生访问的用户；UTC，必须与 --visit-from 成对使用",
+    )
+    p_report.add_argument(
+        "--include-users",
+        action="store_true",
+        help="在汇总之外追加 visit_user_ids 与 converted_user_ids 两个编号数组"
+        "（按 user_id 原值去重，按 Unicode 码点升序），不改变汇总数值",
     )
     p_report.set_defaults(func=cmd_report)
 

@@ -22,6 +22,12 @@ python -m funnel report --db events.sqlite
 python -m funnel report --db events.sqlite --within-seconds 60
 ```
 
+只统计指定访问时间段内的漏斗（可选，两参数须成对使用，仅影响本次报告）：
+
+```sh
+python -m funnel report --db events.sqlite --visit-from 2026-10-06T10:00:00 --visit-before 2026-10-06T11:00:00
+```
+
 ## 事件格式
 
 UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
@@ -43,6 +49,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 - 访问人数：发生过 `visit` 的用户去重计数
 - 转化人数：存在严格晚于某次 `visit` 的 `signup` 的用户去重计数（相等时刻不算转化）
 - `--within-seconds N`：在上述条件上追加"间隔不超过 N 秒"（恰好 N 秒计入）；同一用户多次访问中任意一次满足即可。仅接受全为 ASCII 数字且大于零的整数（允许前导零），否则退出码 2、标准输出为空、标准错误指出 `--within-seconds` 及原因，不创建数据库也不修改记录
+- `--visit-from` 与 `--visit-before`：只统计 visit 落在 `[起点, 终点)` 内的用户，转化也只允许与段内 visit 配对（signup 可以晚于终点）；同一用户任一段内 visit 满足即可，最多计一人。两参数必须成对使用，取值必须是 `YYYY-MM-DDTHH:MM:SS` 有效时间（视为 UTC，不接受时区后缀、小数秒或前后空白），且起点须严格早于终点。缺少配对参数、格式或取值非法、起终点相等或逆序，均退出码 2、标准输出为空、标准错误指出相关参数与原因；参数错误先于数据库访问，不创建数据库也不修改记录。两个筛选可同时使用，注册须严格晚于段内 visit 且间隔不超过 N 秒
 - 统计不依赖行序；重复事件与重复导入不增加人数
 - 转化比例 = 转化人数 / 访问人数；零访问时三项均为 0
 

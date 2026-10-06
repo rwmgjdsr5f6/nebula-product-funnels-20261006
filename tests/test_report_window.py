@@ -75,6 +75,44 @@ HUGE_WITHIN_SECONDS_LONG = "9" * 5000  # 5000 个字符 9
 # 非法 --within-seconds 取值：0、负数、小数、带单位、全角数字。
 INVALID_WITHIN_SECONDS = ["0", "-1", "1.5", "60s", "６０"]
 
+# 边界非法取值：空串、空白、正负号、单位后缀、全角数字，以及位于开头、
+# 中间、末尾的真实 LF / CRLF / 制表符。完整参数值只允许字符 0-9，
+# 不裁剪、不忽略任何其他字符（含末尾换行）。
+INVALID_WITHIN_SECONDS_BOUNDARY = [
+    "",  # 空串
+    " ",  # 空格
+    "\t",  # 制表符
+    "\n",  # 仅 LF
+    "\r\n",  # 仅 CRLF
+    "+60",  # 正号
+    "-60",  # 负号
+    "1.5",  # 小数
+    "60s",  # 单位后缀
+    "６０",  # 全角数字
+    "60\n",  # 末尾真实 LF
+    "000\n",  # 全零加末尾 LF：同样按非法字符拒绝，不得脱离参数错误协议
+    "9" * 5000 + "\n",  # 五千个 9 加末尾 LF：与短值同一拒绝结果
+    "\n60",  # 开头 LF
+    "6\n0",  # 中间 LF
+    "60\r\n",  # 末尾 CRLF
+    "60\t",  # 末尾制表符
+    " 60",  # 开头空格
+    "60 ",  # 末尾空格
+]
+
+# 仅由零组成的取值：原因必须指出数值应大于零。
+ZERO_ONLY_WITHIN_SECONDS = ["0", "000", "0" * 5000]
+
+# 验收四事件样例：2026-10-06 UTC。
+# u1：10:00:00 visit，10:01:00 signup（间隔 60 秒，窗口上界包含）
+# u2：10:00:00 visit，10:01:01 signup（间隔 61 秒，60 秒窗口内不计）
+FOUR_EVENT_ACCEPTANCE = [
+    {"user_id": "u1", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u1", "event": "signup", "timestamp": "2026-10-06T10:01:00"},
+    {"user_id": "u2", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u2", "event": "signup", "timestamp": "2026-10-06T10:01:01"},
+]
+
 EXPECTED_METRIC_KEYS = {"visit_users", "converted_users", "conversion_rate"}
 
 
@@ -296,6 +334,73 @@ class FunnelReportTests(unittest.TestCase):
                     os.path.exists(db),
                     msg="非法参数 %r 不应创建数据库文件 %s" % (value, db),
                 )
+
+    # -- 参数边界：换行、空白与其他非数字字符 ------------------------------
+
+    def assertInvalidWithinSeconds(self, result, reason):
+        """非法窗口参数的统一错误协议：退出码 2、标准输出为空、
+        标准错误指出 --within-seconds 及原因，不输出异常堆栈。"""
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("--within-seconds", result.stderr)
+        self.assertIn(reason, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_boundary_invalid_values_rejected_with_existing_db(self):
+        db = self.import_events(FOUR_EVENT_ACCEPTANCE, jsonl_name="four.jsonl")
+        before = self.snapshot_events(db)
+        for value in INVALID_WITHIN_SECONDS_BOUNDARY:
+            with self.subTest(value=value):
+                result = self.report(db, value)
+                # 含非 ASCII 数字字符或为空：原因只接受 ASCII 数字正整数。
+                self.assertInvalidWithinSeconds(result, "只含 ASCII 数字")
+        # 数据库已有记录保持原样。
+        self.assertEqual(self.snapshot_events(db), before)
+
+    def test_boundary_invalid_values_do_not_create_db(self):
+        for index, value in enumerate(INVALID_WITHIN_SECONDS_BOUNDARY):
+            with self.subTest(value=value):
+                db = self.db_path("missing-boundary-%d.sqlite" % index)
+                self.assertFalse(os.path.exists(db))
+                result = self.report(db, value)
+                # 数据库路径不存在时也先返回参数错误。
+                self.assertInvalidWithinSeconds(result, "只含 ASCII 数字")
+                # 不创建数据库或附属文件。
+                self.assertFalse(os.path.exists(db))
+                self.assertFalse(os.path.exists(db + "-journal"))
+                self.assertFalse(os.path.exists(db + "-wal"))
+                self.assertFalse(os.path.exists(db + "-shm"))
+
+    def test_zero_only_values_report_greater_than_zero_reason(self):
+        db = self.import_events(FOUR_EVENT_ACCEPTANCE, jsonl_name="four.jsonl")
+        for value in ZERO_ONLY_WITHIN_SECONDS:
+            with self.subTest(value=value):
+                result = self.report(db, value)
+                # 仅由零组成：原因说明数值应大于零。
+                self.assertInvalidWithinSeconds(result, "大于零")
+
+    def test_trailing_lf_values_follow_same_rejection(self):
+        # 60、000、五千个 9 后接真实 LF：与各自无换行前缀的非法结果一致。
+        db = self.import_events(FOUR_EVENT_ACCEPTANCE, jsonl_name="four.jsonl")
+        for value in ("60\n", "000\n", "9" * 5000 + "\n"):
+            with self.subTest(value=value):
+                result = self.report(db, value)
+                self.assertInvalidWithinSeconds(result, "只含 ASCII 数字")
+
+    # -- 四事件验收样例 ---------------------------------------------------
+
+    def test_four_event_acceptance_windows(self):
+        db = self.import_events(FOUR_EVENT_ACCEPTANCE, jsonl_name="four.jsonl")
+        # 窗口 60：u1 恰好 60 秒计入（上界包含），u2 间隔 61 秒不计。
+        self.assertReportMetrics(self.report(db, 60), 2, 1, 0.5)
+        # 前导零写法与 60 等价。
+        self.assertReportMetrics(self.report(db, "00060"), 2, 1, 0.5)
+        # 窗口 59：两人都不在窗口内。
+        self.assertReportMetrics(self.report(db, 59), 2, 0, 0)
+        # 超大合法窗口与省略窗口：两人都转化。
+        self.assertReportMetrics(self.report(db, HUGE_WITHIN_SECONDS), 2, 2, 1)
+        self.assertReportMetrics(self.report(db, HUGE_WITHIN_SECONDS_LONG), 2, 2, 1)
+        self.assertReportMetrics(self.report(db), 2, 2, 1)
 
     # -- 报告不改动已有记录 ----------------------------------------------
 

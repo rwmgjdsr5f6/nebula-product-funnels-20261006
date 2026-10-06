@@ -17,7 +17,10 @@ from datetime import datetime
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 VALID_EVENTS = ("visit", "signup")
-WITHIN_SECONDS_RE = re.compile(r"^[0-9]+$")
+# 注意必须用 fullmatch 整体匹配：re.match 配合 "$" 会放过末尾一个真实
+# LF（"$" 可匹配换行前的位置），导致 "60\n" 被误收、"000\n" 在 int() 处
+# 抛出未捕获异常。fullmatch 要求整个字符串恰好是 ASCII 数字，不多不少。
+WITHIN_SECONDS_RE = re.compile(r"[0-9]+")
 
 # SQLite INTEGER 的上限。合法时间戳（公元 1 至 9999 年）之间的最大间隔约
 # 3.2e11 秒，远小于该上限，因此把窗口钳制到此值不会改变任何统计结果，
@@ -143,7 +146,7 @@ def parse_within_seconds(text):
     （合法时间戳之间的间隔不可能达到该量级），统一钳制到该上限返回；
     比较按去前导零后的十进制字符串进行，不依赖 int() 的位数限制。
     """
-    if not WITHIN_SECONDS_RE.match(text):
+    if not WITHIN_SECONDS_RE.fullmatch(text):
         raise argparse.ArgumentTypeError(
             "必须是只含 ASCII 数字的正整数，得到 %r" % text
         )

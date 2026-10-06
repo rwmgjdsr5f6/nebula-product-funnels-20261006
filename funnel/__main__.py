@@ -64,6 +64,18 @@ def parse_line(text, line_no):
     user_id = obj["user_id"]
     if not isinstance(user_id, str) or user_id == "":
         raise LineError(line_no, "user_id 必须是非空字符串")
+    # 拒绝未配对的 Unicode 代理码点：JSON 转义 \ud800 一类孤立高/低代理经
+    # json 解析后会留下 U+D800–U+DFFF 的码点；合法代理对（如
+    # 😀）已被解析成单个补充平面字符（😀），不会落到此区间。
+    # 不能把原值直接写进标准错误：代理码点无法按 UTF-8 编码输出，故用 %r
+    # 以 \uXXXX 转义形式回显 user_id。
+    for ch in user_id:
+        if 0xD800 <= ord(ch) <= 0xDFFF:
+            raise LineError(
+                line_no,
+                "user_id %r 含未配对代理码点 U+%04X：代理码点必须成对出现，"
+                "不允许孤立的 U+D800 至 U+DFFF 码点" % (user_id, ord(ch)),
+            )
 
     if "event" not in obj:
         raise LineError(line_no, "缺少必填字段 event")

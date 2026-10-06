@@ -4,6 +4,7 @@
     python -m funnel report --db <events.sqlite> [--within-seconds N]
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
+                              [--include-users]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -165,18 +166,32 @@ def parse_within_seconds(text):
     return int(digits)
 
 
-def _visit_window_clause(args):
-    """段内 visit 过滤片段；不提供时间段时为空（全库统计）。"""
-    if args.visit_from is None:
-        return ""
-    return "AND v.timestamp >= ? AND v.timestamp < ?"
-
-
-def _converted_sql(args):
-    """转化人数查询：visit 必须在段内（如有），signup 只要求严格晚于该次
-    visit，signup 自身可以晚于段终点。"""
+def _visit_sql(args, select):
+    """访问侧查询：select 决定聚合形态（计数或列出 user_id）。"""
     sql = [
-        "SELECT COUNT(DISTINCT v.user_id)",
+        "SELECT %s" % select,
+        "FROM events",
+        "WHERE event = 'visit'",
+    ]
+    if args.visit_from is not None:
+        # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
+        # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
+        sql.append("AND timestamp >= ? AND timestamp < ?")
+    return "\n".join(sql)
+
+
+def _visit_params(args):
+    if args.visit_from is None:
+        return ()
+    return (args.visit_from, args.visit_before)
+
+
+def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
+    """转化侧查询：visit 必须在段内（如有），signup 只要求严格晚于该次
+    visit，signup 自身可以晚于段终点。select 决定聚合形态（计数或列出
+    user_id），筛选条件与计数完全一致。"""
+    sql = [
+        "SELECT %s" % select,
         "FROM events v",
         "JOIN events s",
         "  ON s.user_id = v.user_id",
@@ -190,7 +205,8 @@ def _converted_sql(args):
             "\n                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?"
         )
     sql.append("WHERE v.event = 'visit'")
-    sql.append(_visit_window_clause(args))
+    if args.visit_from is not None:
+        sql.append("AND v.timestamp >= ? AND v.timestamp < ?")
     return "\n".join(sql)
 
 
@@ -255,23 +271,29 @@ def cmd_report(args):
         conn = sqlite3.connect(args.db)
         try:
             conn.execute(SCHEMA)
-            if args.visit_from is None:
-                visit_users = conn.execute(
-                    "SELECT COUNT(DISTINCT user_id) FROM events WHERE event = 'visit'"
-                ).fetchone()[0]
-            else:
-                # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
-                # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
-                visit_users = conn.execute(
-                    """
-                    SELECT COUNT(DISTINCT user_id) FROM events
-                    WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?
-                    """,
-                    (args.visit_from, args.visit_before),
-                ).fetchone()[0]
+            visit_users = conn.execute(
+                _visit_sql(args, "COUNT(DISTINCT user_id)"), _visit_params(args)
+            ).fetchone()[0]
             converted_users = conn.execute(
                 _converted_sql(args), _converted_params(args)
             ).fetchone()[0]
+            if args.include_users:
+                # 明细与汇总共用同一套筛选条件；按 user_id 原值去重（DISTINCT）
+                # 后在 Python 侧排序：str 比较即 Unicode 码点字典序，区分大小写，
+                # 保留编号中的空白与中文，不按数字大小排序。
+                visit_user_ids = sorted(
+                    row[0]
+                    for row in conn.execute(
+                        _visit_sql(args, "DISTINCT user_id"), _visit_params(args)
+                    )
+                )
+                converted_user_ids = sorted(
+                    row[0]
+                    for row in conn.execute(
+                        _converted_sql(args, "DISTINCT v.user_id"),
+                        _converted_params(args),
+                    )
+                )
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -279,15 +301,15 @@ def cmd_report(args):
         return 2
 
     conversion_rate = converted_users / visit_users if visit_users else 0
-    print(
-        json.dumps(
-            {
-                "visit_users": visit_users,
-                "converted_users": converted_users,
-                "conversion_rate": conversion_rate,
-            }
-        )
-    )
+    payload = {
+        "visit_users": visit_users,
+        "converted_users": converted_users,
+        "conversion_rate": conversion_rate,
+    }
+    if args.include_users:
+        payload["visit_user_ids"] = visit_user_ids
+        payload["converted_user_ids"] = converted_user_ids
+    print(json.dumps(payload))
     return 0
 
 
@@ -325,6 +347,12 @@ def main(argv=None):
         default=None,
         metavar="YYYY-MM-DDTHH:MM:SS",
         help="只统计该终点（不含）之前发生访问的用户；UTC，必须与 --visit-from 成对使用",
+    )
+    p_report.add_argument(
+        "--include-users",
+        action="store_true",
+        help="在报告中追加 visit_user_ids 与 converted_user_ids 两个数组，"
+        "列出计入统计的用户编号（去重后按 Unicode 码点升序）；汇总数值不变",
     )
     p_report.set_defaults(func=cmd_report)
 

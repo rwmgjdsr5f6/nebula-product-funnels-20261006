@@ -7,17 +7,24 @@
 """
 
 import argparse
+import calendar
 import json
 import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime
 
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 VALID_EVENTS = ("visit", "signup")
 WITHIN_SECONDS_RE = re.compile(r"^[0-9]+$")
+
+# --within-seconds 不设数值或位数上限：解除 Python 3.11+ 对 int 字符串
+# 转换的默认位数限制（4300 位），使任意长度的合法十进制窗口都能解析。
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -143,6 +150,14 @@ def parse_within_seconds(text):
     return value
 
 
+def epoch_seconds(timestamp):
+    """把 YYYY-MM-DDTHH:MM:SS（统一视为 UTC）转为 Unix 秒。
+
+    使用 calendar.timegm 得到 Python 整数，精度不受 SQLite 64 位整数上限约束。
+    """
+    return calendar.timegm(time.strptime(timestamp, TIMESTAMP_FORMAT))
+
+
 def cmd_report(args):
     if not os.path.exists(args.db):
         print("%s: 数据库不存在" % args.db, file=sys.stderr)
@@ -168,21 +183,27 @@ def cmd_report(args):
                     """
                 ).fetchone()[0]
             else:
-                # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒
-                converted_users = conn.execute(
+                # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒。
+                # 间隔在 Python 中用任意精度整数计算：N 不设数值上限，
+                # 超过 SQLite 64 位整数范围的窗口也能正常统计。
+                pairs = conn.execute(
                     """
-                    SELECT COUNT(DISTINCT v.user_id)
+                    SELECT v.user_id, v.timestamp, s.timestamp
                     FROM events v
                     JOIN events s
                       ON s.user_id = v.user_id
                      AND s.event = 'signup'
                      AND s.timestamp > v.timestamp
-                     AND CAST(strftime('%s', s.timestamp) AS INTEGER)
-                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?
                     WHERE v.event = 'visit'
-                    """,
-                    (args.within_seconds,),
-                ).fetchone()[0]
+                    """
+                ).fetchall()
+                converted = {
+                    user_id
+                    for user_id, visit_ts, signup_ts in pairs
+                    if epoch_seconds(signup_ts) - epoch_seconds(visit_ts)
+                    <= args.within_seconds
+                }
+                converted_users = len(converted)
         finally:
             conn.close()
     except sqlite3.Error as exc:

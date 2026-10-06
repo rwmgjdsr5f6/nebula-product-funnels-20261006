@@ -56,6 +56,23 @@ SIGNUP_ONLY_EVENTS = [
     {"user_id": "u6", "event": "signup", "timestamp": "2026-10-06T10:00:30"},
 ]
 
+# 验收样例：与 sample.jsonl 同款的五条事件（2026-10-06）。
+# u1：10:00:00 visit，10:01:00 signup（间隔 60 秒）
+# u2：只有 10:00:00 visit
+# u3：09:59:00 signup，10:00:00 visit（注册早于访问，永不转化）
+ACCEPTANCE_EVENTS = [
+    {"user_id": "u1", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u1", "event": "signup", "timestamp": "2026-10-06T10:01:00"},
+    {"user_id": "u2", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+    {"user_id": "u3", "event": "signup", "timestamp": "2026-10-06T09:59:00"},
+    {"user_id": "u3", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+]
+
+# 超过 SQLite 64 位整数上限（9223372036854775807）的合法窗口。
+INT64_MAX_PLUS_ONE = "9223372036854775808"
+# 5000 个字符 9 组成的超大窗口：参数不设数值或位数上限。
+HUGE_WINDOW = "9" * 5000
+
 # 非法 --within-seconds 取值：0、负数、小数、带单位、全角数字。
 INVALID_WITHIN_SECONDS = ["0", "-1", "1.5", "60s", "６０"]
 
@@ -194,6 +211,67 @@ class FunnelReportTests(unittest.TestCase):
         db = self.import_events(SIGNUP_ONLY_EVENTS, jsonl_name="signup_only.jsonl")
         self.assertReportMetrics(self.report(db), 0, 0, 0)
         self.assertReportMetrics(self.report(db, 60), 0, 0, 0)
+
+    # -- 超大窗口（超过 SQLite 64 位整数上限） ----------------------------
+
+    def import_acceptance_events(self):
+        """导入五条验收事件并断言 imported 为 5，返回数据库路径。"""
+        db = self.db_path()
+        path = self.write_jsonl("acceptance.jsonl", ACCEPTANCE_EVENTS)
+        result = run_funnel("import", path, "--db", db)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertEqual(payload, {"imported": 5})
+        return db
+
+    def test_int64_max_plus_one_window(self):
+        db = self.import_acceptance_events()
+        # 9223372036854775808（2^63）也能正常出报告：u1 转化，u2 无注册、
+        # u3 注册早于访问，均不计。
+        self.assertReportMetrics(
+            self.report(db, INT64_MAX_PLUS_ONE), 3, 1, 1 / 3
+        )
+
+    def test_huge_window_5000_nines(self):
+        db = self.import_acceptance_events()
+        # 5000 位大数窗口与 2^63 结果一致，且不出现异常堆栈。
+        result = self.report(db, HUGE_WINDOW)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertReportMetrics(result, 3, 1, 1 / 3)
+
+    def test_huge_window_matches_unbounded_report(self):
+        db = self.import_acceptance_events()
+        # 大窗口不会让逆序（u3）或同一时刻的注册变成转化：
+        # 结果与不传窗口时相同。
+        for value in (INT64_MAX_PLUS_ONE, HUGE_WINDOW, "00060"):
+            with self.subTest(value=value[:20]):
+                self.assertReportMetrics(self.report(db, value), 3, 1, 1 / 3)
+        self.assertReportMetrics(self.report(db), 3, 1, 1 / 3)
+
+    def test_within_59_seconds_excludes_60_second_gap(self):
+        db = self.import_acceptance_events()
+        # u1 间隔 60 秒，59 秒窗口不计：访问 3 人、转化 0 人、比例 0。
+        self.assertReportMetrics(self.report(db, 59), 3, 0, 0)
+        self.assertReportMetrics(self.report(db, "00059"), 3, 0, 0)
+
+    def test_huge_window_missing_db_follows_path_error_protocol(self):
+        db = self.db_path("missing-huge.sqlite")
+        self.assertFalse(os.path.exists(db))
+        for value in (INT64_MAX_PLUS_ONE, HUGE_WINDOW):
+            with self.subTest(value=value[:20]):
+                result = self.report(db, value)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("数据库不存在", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(os.path.exists(db))
+
+    def test_huge_window_keeps_events_unchanged(self):
+        db = self.import_acceptance_events()
+        before = self.snapshot_events(db)
+        self.assertReportMetrics(self.report(db, HUGE_WINDOW), 3, 1, 1 / 3)
+        self.assertEqual(self.snapshot_events(db), before)
 
     # -- 非法窗口参数 -----------------------------------------------------
 

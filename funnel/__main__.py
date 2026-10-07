@@ -5,7 +5,7 @@
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
                               [--include-users] [--include-pairs]
-                              [--group-by visit-date]
+                              [--group-by visit-date [--include-group-pairs]]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -269,7 +269,46 @@ def _qualifying_visit_date_by_user(conn, visit_where, visit_params):
     )
 
 
-def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
+def _reduce_pairs(rows):
+    """配对归约：每人先取时间最早的 signup，再从能与该注册有效配对的
+    visit 中取时间最晚的一次。
+
+    rows 来自与汇总完全相同的配对 SQL（仅改 select 列表）。时间戳为定宽
+    ISO 文本，字典序比较与时间先后比较等价；重复事件与重复导入产生的
+    相同配对不影响 min/max 结果。返回 {user_id: [signup_ts, visit_ts]}。
+    """
+    best_by_user = {}
+    for user_id, visit_ts, signup_ts in rows:
+        current = best_by_user.get(user_id)
+        if current is None or signup_ts < current[0]:
+            best_by_user[user_id] = [signup_ts, visit_ts]
+        elif signup_ts == current[0] and visit_ts > current[1]:
+            current[1] = visit_ts
+    return best_by_user
+
+
+def _pairs_payload(best_by_user, user_ids=None):
+    """由归约结果装配 conversion_pairs 数组。
+
+    user_ids 为 None 时取全部转化用户（顶层口径），否则只取给定子集
+    （组内口径，调用方保证子集中的编号都在归约结果里）。排序在 Python
+    侧进行：str 比较即 Unicode 码点字典序，区分大小写、保留空白与中文、
+    不按数字大小排序。
+    """
+    ids = best_by_user if user_ids is None else user_ids
+    return [
+        {
+            "user_id": user_id,
+            "visit_timestamp": best_by_user[user_id][1],
+            "signup_timestamp": best_by_user[user_id][0],
+        }
+        for user_id in sorted(ids)
+    ]
+
+
+def _build_visit_date_groups(
+    date_by_user, converted_user_ids, include_users, pairs_by_user=None
+):
     """由归组映射与转化成员集合装配 visit_date_groups。
 
     这是分组结果唯一的装配点：日期成员关系只存在于 date_by_user，转化
@@ -282,6 +321,11 @@ def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
     用户的日期、不补空日期；无合格访问时返回空列表。组内转化成员取本组
     访问成员与转化集合的交集（转化集合本就是合格访问用户的子集，交集同时
     兜底防止组外编号计入）。比例按本组两种人数真除，分母恒为正。
+
+    pairs_by_user 非 None 时（--include-group-pairs），每组再追加
+    conversion_pairs：即本组转化成员在顶层同一归约结果中的配对子集。
+    每个转化用户只归一个日期组，故各组配对合并排序后与顶层数组完全一致，
+    组间不会重复用户；无转化的组得到空数组。
     """
     converted_members = set(converted_user_ids)
     visit_ids_by_date = {}
@@ -303,6 +347,10 @@ def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
             # 编号数组同一口径——区分大小写、保留空白与中文、不按数字大小。
             group["visit_user_ids"] = sorted(visit_ids)
             group["converted_user_ids"] = sorted(converted_ids)
+        if pairs_by_user is not None:
+            # 组内配对与顶层共用同一归约结果，只按本组转化成员过滤；
+            # 数组长度即本组转化人数，排序口径与顶层相同。
+            group["conversion_pairs"] = _pairs_payload(pairs_by_user, converted_ids)
         groups.append(group)
     return groups
 
@@ -327,6 +375,17 @@ def cmd_report(args):
         print(
             "--visit-from 必须严格早于 --visit-before：得到 --visit-from %r、--visit-before %r"
             % (args.visit_from, args.visit_before),
+            file=sys.stderr,
+        )
+        return 2
+
+    # --include-group-pairs 只与 --group-by visit-date 合用：单独提供时按
+    # 参数错误处理，与上面的校验一样先于一切数据库访问，不创建数据库、
+    # 不改动记录。
+    if args.include_group_pairs and args.group_by != "visit-date":
+        print(
+            "--include-group-pairs 必须与 --group-by visit-date 合用："
+            "已提供 --include-group-pairs，缺少 --group-by visit-date",
             file=sys.stderr,
         )
         return 2
@@ -374,31 +433,19 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
-            if args.include_pairs:
-                # 明细沿用与汇总完全相同的配对条件（同一 SQL，仅改 select
-                # 列表），在 Python 侧归约：每人先取时间最早的 signup，再
-                # 从能与该注册有效配对的 visit 中取时间最晚的一次。时间戳
-                # 为定宽 ISO 文本，字典序比较与时间先后比较等价；重复事件
-                # 与重复导入产生的相同配对不影响 min/max 结果。
-                best_by_user = {}  # user_id -> [signup_ts, visit_ts]
-                for user_id, visit_ts, signup_ts in conn.execute(
-                    _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
-                    _converted_params(args),
-                ):
-                    current = best_by_user.get(user_id)
-                    if current is None or signup_ts < current[0]:
-                        best_by_user[user_id] = [signup_ts, visit_ts]
-                    elif signup_ts == current[0] and visit_ts > current[1]:
-                        current[1] = visit_ts
-                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序。
-                conversion_pairs = [
-                    {
-                        "user_id": user_id,
-                        "visit_timestamp": best_by_user[user_id][1],
-                        "signup_timestamp": best_by_user[user_id][0],
-                    }
-                    for user_id in sorted(best_by_user)
-                ]
+            if args.include_pairs or args.include_group_pairs:
+                # 配对明细沿用与汇总完全相同的配对条件（同一 SQL，仅改
+                # select 列表），在 Python 侧归约且只归约一次：顶层数组与
+                # 各日期组的组内数组都从这一份结果装配，二者天然勾稽——
+                # 各组配对合并排序后必与顶层数组完全一致。
+                best_by_user = _reduce_pairs(
+                    conn.execute(
+                        _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
+                        _converted_params(args),
+                    )
+                )
+                if args.include_pairs:
+                    conversion_pairs = _pairs_payload(best_by_user)
             if args.group_by == "visit-date":
                 # 归组与装配分两步，各自只有一个职责（见两函数文档）：
                 # 1) 每人归最早合格 visit 的 UTC 日期，段外历史不影响归组；
@@ -407,7 +454,8 @@ def cmd_report(args):
                 #    合格访问配对（不限于归组那次），signup 严格晚于 visit
                 #    且允许晚于段终点，--within-seconds 上界含等值。
                 # 组内编号数组只在同时启用 --include-users 时追加；
-                # --include-pairs 不向组内追加任何字段。
+                # --include-pairs 不向组内追加任何字段，组内配对明细由
+                # --include-group-pairs 单独控制（不自动开启顶层配对）。
                 date_by_user = _qualifying_visit_date_by_user(
                     conn, visit_where, visit_params
                 )
@@ -419,7 +467,10 @@ def cmd_report(args):
                     )
                 )
                 visit_date_groups = _build_visit_date_groups(
-                    date_by_user, converted_id_set, args.include_users
+                    date_by_user,
+                    converted_id_set,
+                    args.include_users,
+                    best_by_user if args.include_group_pairs else None,
                 )
         finally:
             conn.close()
@@ -494,6 +545,14 @@ def main(argv=None):
         "按 user_id 原值的 Unicode 码点升序），不改变汇总数值",
     )
     p_report.add_argument(
+        "--include-group-pairs",
+        action="store_true",
+        help="与 --group-by visit-date 合用时，每个日期组追加 conversion_pairs "
+        "配对明细数组（口径与顶层 conversion_pairs 相同：每个转化用户一条，"
+        "最早有效 signup 配对最晚有效 visit，按 user_id 原值的 Unicode 码点"
+        "升序）；不自动开启顶层配对或编号明细，单独使用则以退出码 2 拒绝",
+    )
+    p_report.add_argument(
         "--group-by",
         type=parse_group_by,
         default=None,
@@ -501,7 +560,8 @@ def main(argv=None):
         help="按维度分组追加统计；目前只接受 visit-date（每个用户归到最早合格 "
         "visit 的 UTC 日期，在原有 JSON 中追加 visit_date_groups 数组）；"
         "与 --include-users 合用时各组再追加组内 visit_user_ids 与 "
-        "converted_user_ids；不传则输出不变",
+        "converted_user_ids，与 --include-group-pairs 合用时各组再追加组内 "
+        "conversion_pairs；不传则输出不变",
     )
     p_report.set_defaults(func=cmd_report)
 

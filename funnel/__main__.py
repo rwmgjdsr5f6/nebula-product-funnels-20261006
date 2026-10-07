@@ -5,7 +5,7 @@
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
                               [--include-users] [--include-pairs]
-                              [--group-by visit-date]
+                              [--group-by visit-date [--include-group-pairs]]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -217,6 +217,41 @@ def _converted_params(args):
     return tuple(params)
 
 
+def _conversion_pairs_by_user(conn, args):
+    """枚举全部有效配对并按人归约，返回 {user_id: [signup_ts, visit_ts]}。
+
+    顶层 conversion_pairs 与 visit_date_groups 内的组内配对共用这一个归约
+    点：明细沿用与汇总完全相同的配对条件（同一 SQL，仅改 select 列表），
+    在 Python 侧归约——每人先取时间最早的 signup，再从能与该注册有效配对
+    的 visit 中取时间最晚的一次。时间戳为定宽 ISO 文本，字典序比较与时间
+    先后比较等价；重复事件与重复导入产生的相同配对不影响 min/max 结果。
+    """
+    best_by_user = {}
+    for user_id, visit_ts, signup_ts in conn.execute(
+        _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
+        _converted_params(args),
+    ):
+        current = best_by_user.get(user_id)
+        if current is None or signup_ts < current[0]:
+            best_by_user[user_id] = [signup_ts, visit_ts]
+        elif signup_ts == current[0] and visit_ts > current[1]:
+            current[1] = visit_ts
+    return best_by_user
+
+
+def _pair_entry(user_id, best):
+    """把归约结果 [signup_ts, visit_ts] 装配成一个配对对象。
+
+    顶层数组与组内数组共用同一构造，字段名、字段顺序与 UTC 时间格式天然
+    一致：每个对象只含 user_id、visit_timestamp、signup_timestamp。
+    """
+    return {
+        "user_id": user_id,
+        "visit_timestamp": best[1],
+        "signup_timestamp": best[0],
+    }
+
+
 def parse_group_by(text):
     """--group-by 取值校验：目前只接受 visit-date。
 
@@ -269,7 +304,9 @@ def _qualifying_visit_date_by_user(conn, visit_where, visit_params):
     )
 
 
-def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
+def _build_visit_date_groups(
+    date_by_user, converted_user_ids, include_users, best_pair_by_user=None
+):
     """由归组映射与转化成员集合装配 visit_date_groups。
 
     这是分组结果唯一的装配点：日期成员关系只存在于 date_by_user，转化
@@ -277,6 +314,12 @@ def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
     比例与（可选的）组内编号数组全部从这两个集合就地派生，不再为同一
     统计事实平行维护计数与编号集合——人数即成员集合的 len，编号数组即
     成员集合的 sorted，二者天然勾稽。
+
+    best_pair_by_user 非 None 时（仅 --include-group-pairs 与分组同开），
+    每个组再追加 conversion_pairs：配对对象按 user_id 在组内访问成员与
+    配对映射的交集中选取——用户仍按最早合格 visit 归组，配对用的 visit
+    可以发生在其他日期，绝不能按配对时间重新归组；交集同时兜底保证组间
+    不重复用户。映射缺键的访问成员不是转化用户，不产出配对。
 
     日期按定宽 YYYY-MM-DD 文本升序（字典序即时间先后），只列有合格访问
     用户的日期、不补空日期；无合格访问时返回空列表。组内转化成员取本组
@@ -303,6 +346,15 @@ def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
             # 编号数组同一口径——区分大小写、保留空白与中文、不按数字大小。
             group["visit_user_ids"] = sorted(visit_ids)
             group["converted_user_ids"] = sorted(converted_ids)
+        if best_pair_by_user is not None:
+            # 组内配对与顶层 conversion_pairs 共用同一归约结果（见
+            # _conversion_pairs_by_user），只是按归组日期分配；排序同样在
+            # Python 侧按 user_id 原值的 Unicode 码点字典序进行。无转化的
+            # 组没有任何交集成员，自然得到空数组。
+            group["conversion_pairs"] = [
+                _pair_entry(user_id, best_pair_by_user[user_id])
+                for user_id in sorted(visit_ids & set(best_pair_by_user))
+            ]
         groups.append(group)
     return groups
 
@@ -327,6 +379,18 @@ def cmd_report(args):
         print(
             "--visit-from 必须严格早于 --visit-before：得到 --visit-from %r、--visit-before %r"
             % (args.visit_from, args.visit_before),
+            file=sys.stderr,
+        )
+        return 2
+
+    # 组内配对必须依附分组：只提供 --include-group-pairs 而没有
+    # --group-by visit-date 时直接退出码 2。该校验与上面的时段检查同属
+    # 参数校验，先于 os.path.exists 与一切数据库访问：不创建数据库、不
+    # 改动记录。
+    if args.include_group_pairs and args.group_by != "visit-date":
+        print(
+            "--include-group-pairs 只能与 --group-by visit-date 合用："
+            "已提供 --include-group-pairs，但未提供 --group-by visit-date",
             file=sys.stderr,
         )
         return 2
@@ -374,40 +438,28 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
-            if args.include_pairs:
-                # 明细沿用与汇总完全相同的配对条件（同一 SQL，仅改 select
-                # 列表），在 Python 侧归约：每人先取时间最早的 signup，再
-                # 从能与该注册有效配对的 visit 中取时间最晚的一次。时间戳
-                # 为定宽 ISO 文本，字典序比较与时间先后比较等价；重复事件
-                # 与重复导入产生的相同配对不影响 min/max 结果。
-                best_by_user = {}  # user_id -> [signup_ts, visit_ts]
-                for user_id, visit_ts, signup_ts in conn.execute(
-                    _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
-                    _converted_params(args),
-                ):
-                    current = best_by_user.get(user_id)
-                    if current is None or signup_ts < current[0]:
-                        best_by_user[user_id] = [signup_ts, visit_ts]
-                    elif signup_ts == current[0] and visit_ts > current[1]:
-                        current[1] = visit_ts
-                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序。
-                conversion_pairs = [
-                    {
-                        "user_id": user_id,
-                        "visit_timestamp": best_by_user[user_id][1],
-                        "signup_timestamp": best_by_user[user_id][0],
-                    }
-                    for user_id in sorted(best_by_user)
-                ]
+            if args.include_pairs or args.include_group_pairs:
+                # 顶层配对与组内配对共用同一份归约结果（同一 SQL，同一
+                # min/max 归约，见 _conversion_pairs_by_user）：每人先锁定
+                # 时间最早的有效 signup，再取能与其配对的最晚 visit。
+                best_pair_by_user = _conversion_pairs_by_user(conn, args)
+                if args.include_pairs:
+                    # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序。
+                    conversion_pairs = [
+                        _pair_entry(user_id, best_pair_by_user[user_id])
+                        for user_id in sorted(best_pair_by_user)
+                    ]
             if args.group_by == "visit-date":
                 # 归组与装配分两步，各自只有一个职责（见两函数文档）：
                 # 1) 每人归最早合格 visit 的 UTC 日期，段外历史不影响归组；
-                # 2) 各组人数、比例与编号数组全部由归组成员与转化成员两个
-                #    集合就地派生。转化集合与汇总完全同源：可使用该用户任意
-                #    合格访问配对（不限于归组那次），signup 严格晚于 visit
-                #    且允许晚于段终点，--within-seconds 上界含等值。
+                # 2) 各组人数、比例、编号数组与（可选的）组内配对全部由
+                #    归组成员、转化成员两个集合与同一份配对归约就地派生。
+                #    转化集合与汇总完全同源：可使用该用户任意合格访问配对
+                #    （不限于归组那次），signup 严格晚于 visit 且允许晚于段
+                #    终点，--within-seconds 上界含等值。
                 # 组内编号数组只在同时启用 --include-users 时追加；
-                # --include-pairs 不向组内追加任何字段。
+                # 组内配对数组只在同时启用 --include-group-pairs 时追加，
+                # --include-pairs 单独不向组内追加任何字段。
                 date_by_user = _qualifying_visit_date_by_user(
                     conn, visit_where, visit_params
                 )
@@ -418,8 +470,14 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
+                group_best = (
+                    best_pair_by_user if args.include_group_pairs else None
+                )
                 visit_date_groups = _build_visit_date_groups(
-                    date_by_user, converted_id_set, args.include_users
+                    date_by_user,
+                    converted_id_set,
+                    args.include_users,
+                    group_best,
                 )
         finally:
             conn.close()
@@ -492,6 +550,14 @@ def main(argv=None):
         help="在汇总之外追加 conversion_pairs 配对明细数组"
         "（每个转化用户一条：最早有效 signup 配对最晚有效 visit，"
         "按 user_id 原值的 Unicode 码点升序），不改变汇总数值",
+    )
+    p_report.add_argument(
+        "--include-group-pairs",
+        action="store_true",
+        help="仅与 --group-by visit-date 合用：每个日期组追加 conversion_pairs "
+        "组内配对数组（字段与排序口径与顶层配对一致；用户仍按最早合格 visit "
+        "归组，配对 visit 可在其他日期）；不合用退出码 2。不自动开启顶层配对，"
+        "也不开启编号明细，不改变汇总数值",
     )
     p_report.add_argument(
         "--group-by",

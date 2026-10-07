@@ -49,6 +49,14 @@ python -m funnel report --db events.sqlite --include-pairs
 python -m funnel report --db events.sqlite --group-by visit-date
 ```
 
+在每个日期组内追加配对明细（可选，不带取值，只能与 `--group-by visit-date` 合用；不自动开启顶层配对或编号明细，仅影响本次报告）：
+
+```sh
+python -m funnel report --db events.sqlite --group-by visit-date --include-group-pairs
+```
+
+只提供 `--include-group-pairs` 而不分组时退出码 2、标准输出为空、标准错误指出该开关及其依赖项，且不创建数据库或改动记录。
+
 ## 事件格式
 
 UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
@@ -62,7 +70,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 ## 输出与退出码
 
 - 导入成功：退出码 0，标准输出仅 `{"imported": N}`（本次有效记录数）
-- 报告成功：退出码 0，标准输出仅 `{"visit_users": V, "converted_users": C, "conversion_rate": R}`；加 `--include-users` 时追加 `"visit_user_ids"` 与 `"converted_user_ids"` 两个字符串数组；加 `--include-pairs` 时追加 `"conversion_pairs"` 配对明细数组；加 `--group-by visit-date` 时追加 `"visit_date_groups"` 分组数组（各开关可合用，分组与编号同开时组对象内再带两个编号数组，详见统计规则）
+- 报告成功：退出码 0，标准输出仅 `{"visit_users": V, "converted_users": C, "conversion_rate": R}`；加 `--include-users` 时追加 `"visit_user_ids"` 与 `"converted_user_ids"` 两个字符串数组；加 `--include-pairs` 时追加 `"conversion_pairs"` 配对明细数组；加 `--group-by visit-date` 时追加 `"visit_date_groups"` 分组数组（各开关可合用，分组与编号同开时组对象内再带两个编号数组，分组与 `--include-group-pairs` 同开时组对象内再带组内 `conversion_pairs` 数组，详见统计规则）；`--include-group-pairs` 不与 `--group-by visit-date` 合用则退出码 2、标准输出为空、标准错误指出该开关及其依赖项，且不创建数据库或改动记录
 - 输入文件无法读取、数据库无法访问、报告数据库不存在：退出码 2，标准输出为空，标准错误说明路径与原因
 
 ## 统计规则
@@ -76,6 +84,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 - `--include-pairs`：在汇总之外输出 `conversion_pairs` 配对明细，用于核对每个转化用户的事件依据。明细沿用与汇总完全相同的配对条件（访问时段含起点不含终点、signup 严格晚于段内 visit、`--within-seconds` 上界含等值）。每个转化用户只出现一次：先在其全部有效配对中选时间最早的 `signup`，再从能与该注册有效配对的 `visit` 中选时间最晚的一次。每个对象只含 `user_id`、`visit_timestamp`、`signup_timestamp` 三个字段，时间戳沿用 `YYYY-MM-DDTHH:MM:SS` UTC 格式。数组按 `user_id` 原值的 Unicode 码点字典序升序排列，长度等于 `converted_users`；与 `--include-users` 合用时，数组中的编号集合等于 `converted_user_ids`。没有转化时数组为空；不传该开关时输出保持现状，该开关不改变汇总数值与编号明细
 - `--group-by visit-date`：在汇总之外输出 `visit_date_groups` 分组数组，每个对象含 `visit_date`（UTC 日期 `YYYY-MM-DD`）、`visit_users`、`converted_users`、`conversion_rate`。每个用户只归入其最早一次**合格 visit** 的 UTC 日期组：合格访问沿用当前访问时段含起点、不含终点的筛选（无时段即全库），段外历史不参与归组；同一用户其他日期的访问不再产生第二个组。组内转化判定与汇总完全一致——可使用该用户任意一次合格 visit 配对，不限于归组那次，signup 严格晚于 visit 且允许晚于时段终点，`--within-seconds` 上界含等值。数组按日期升序，只列出有访问用户的日期（不补空日期）；各组访问人数、转化人数之和分别等于汇总人数，组内比例按组内人数真除。没有合格访问时数组为空。非法分组值或缺少取值退出码 2、标准输出为空、标准错误指出参数与原因，且不创建数据库
 - `--group-by visit-date` 与 `--include-users` 同时启用时，每个日期组对象在上述四个字段后追加 `visit_user_ids` 与 `converted_user_ids`：两数组按 `user_id` 原值去重、再按 Unicode 码点升序（区分大小写，保留空白与中文，不按数字大小），排序口径与顶层两个编号数组一致；数组长度分别等于该组 `visit_users`、`converted_users`，组内转化数组是本组访问数组的子集，无转化的组返回空转化数组。各组访问编号合并后等于顶层 `visit_user_ids`、各组转化编号合并后等于顶层 `converted_user_ids`，且组间没有重复编号。只开启分组或只开启 `--include-users` 时输出字段维持现状；`--include-pairs` 不向组内追加配对
+- `--group-by visit-date` 与 `--include-group-pairs` 同时启用时，每个日期组对象再追加 `conversion_pairs` 组内配对数组：元素沿用顶层配对的三个字段（`user_id`、`visit_timestamp`、`signup_timestamp`）与 UTC 时间格式，配对选择规则也与顶层完全一致——每个转化用户只出现一次，先取其最早有效 `signup`，再取能与该注册配对的最晚 `visit`（访问时段含起点不含终点，段外访问不配对；注册允许晚于时段终点；注册严格晚于访问；`--within-seconds` 上界含等值，未设时限则不限间隔）。用户仍按最早合格 visit 归组，配对用的 visit 可以发生在其他日期，不按配对时间重新归组，故组间不重复用户。数组按 `user_id` 原值的 Unicode 码点字典序升序（区分大小写，保留空白与中文），长度等于本组 `converted_users`；无转化的组返回空数组，无合格访问时分组数组为空。与顶层 `--include-pairs` 同时开启时，各组配对按日期顺序合并、再按 `user_id` 排序后与顶层 `conversion_pairs` 完全一致。该开关不自动开启顶层 `conversion_pairs` 或两个编号数组：顶层字段仍只由 `--include-pairs`、`--include-users` 各自控制；只提供该开关而不提供 `--group-by visit-date` 时退出码 2、标准输出为空、标准错误指出该开关及依赖项，且先于数据库访问、不创建数据库或改动记录；重复事件、重复导入及行序不影响结果
 - 转化比例 = 转化人数 / 访问人数；零访问时三项均为 0
 
 ## 样例

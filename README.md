@@ -67,6 +67,14 @@ python -m funnel report --db events.sqlite --group-by visit-date --include-group
 python -m funnel report --db events.sqlite --group-by visit-date --include-group-latency
 ```
 
+把本次完整报告额外保存到本地 JSON 文件（可选，后接文件路径，与上述所有筛选项和明细开关可同时使用，仅影响本次报告，不改写数据库）：
+
+```sh
+python -m funnel report --db events.sqlite --output report.json
+```
+
+文件为 UTF-8 编码，包含一个完整 JSON 对象并以换行结束，解析后的内容与本次标准输出的单行报告完全一致，不增加导出时间、路径或其他字段。相对路径按当前工作目录解释，父目录须事先存在；目标不存在时创建，已有普通文件时整体覆盖（不追加多个报告）。保存成功时退出码仍为 0，标准输出仍只打印原来的单行报告，标准错误为空；不传 `--output` 时保持仅打印不保存。
+
 ## 事件格式
 
 UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
@@ -80,8 +88,9 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 ## 输出与退出码
 
 - 导入成功：退出码 0，标准输出仅 `{"imported": N}`（本次有效记录数）
-- 报告成功：退出码 0，标准输出仅 `{"visit_users": V, "converted_users": C, "conversion_rate": R}`；加 `--include-users` 时追加 `"visit_user_ids"` 与 `"converted_user_ids"` 两个字符串数组；加 `--include-pairs` 时追加 `"conversion_pairs"` 配对明细数组；加 `--include-latency` 时在**顶层**追加 `"conversion_latency"` 整体耗时对象（组内是否追加耗时由 `--include-group-latency` 单独控制）；加 `--group-by visit-date` 时追加 `"visit_date_groups"` 分组数组（各开关可合用，分组与编号同开时组对象内再带两个编号数组，分组与 `--include-group-pairs` 同开时组对象内再带配对数组，分组与 `--include-group-latency` 同开时组对象内再带组内 `conversion_latency` 耗时对象，详见统计规则）
+- 报告成功：退出码 0，标准输出仅 `{"visit_users": V, "converted_users": C, "conversion_rate": R}`；加 `--include-users` 时追加 `"visit_user_ids"` 与 `"converted_user_ids"` 两个字符串数组；加 `--include-pairs` 时追加 `"conversion_pairs"` 配对明细数组；加 `--include-latency` 时在**顶层**追加 `"conversion_latency"` 整体耗时对象（组内是否追加耗时由 `--include-group-latency` 单独控制）；加 `--group-by visit-date` 时追加 `"visit_date_groups"` 分组数组（各开关可合用，分组与编号同开时组对象内再带两个编号数组，分组与 `--include-group-pairs` 同开时组对象内再带配对数组，分组与 `--include-group-latency` 同开时组对象内再带组内 `conversion_latency` 耗时对象，详见统计规则）；加 `--output <路径>` 时把同一份报告保存到该文件，标准输出内容不变
 - 输入文件无法读取、数据库无法访问、报告数据库不存在：退出码 2，标准输出为空，标准错误说明路径与原因
+- `--output` 缺少取值或取空字符串：退出码 2，标准输出为空，标准错误指出 `--output` 及原因，且在数据库访问前拒绝；输出路径与 `--db` 按当前系统规则规范化后得到同一绝对路径时同样提前拒绝，标准错误指出两个参数；父目录不存在、目标是目录或目标无法写入时退出码 2，标准输出为空，标准错误包含输出路径及原因。参数校验或报告查询失败时不创建或改写输出文件；保存失败时已有目标保留原内容，原本不存在的目标不留下不完整文件；上述失败均不改变数据库里的事件记录
 
 ## 统计规则
 
@@ -98,6 +107,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 - `--include-group-pairs`：仅与 `--group-by visit-date` 合用，每个日期组对象追加 `conversion_pairs` 配对明细数组，用于按组核对配对。组内每个转化用户只出现一次，配对口径与顶层 `conversion_pairs` 完全一致（最早有效 `signup` 配对能匹配它的最晚 `visit`，三个字段与 UTC 时间格式相同，访问时段含起点不含终点、段外访问不配对、注册允许晚于终点、`--within-seconds` 上界含等值）。用户仍按最早合格 visit 归组，配对访问可以落在其他日期，不据配对时间重新归组。组内数组按 `user_id` 原值的 Unicode 码点字典序升序，长度等于本组 `converted_users`；无转化的组返回空数组，无合格访问时分组数组为空。与 `--include-pairs` 同时开启时，各组配对合并排序后与顶层数组完全一致，组间不重复用户。该开关不自动开启顶层配对或编号明细，原开关仍各自控制原字段；不传该开关时输出保持现状。单独使用（不带 `--group-by visit-date`）退出码 2、标准输出为空、标准错误指出该开关及依赖项，且先于数据库访问，不创建数据库或改动记录
 - `--include-group-latency`：仅与 `--group-by visit-date` 合用，每个日期组对象追加 `conversion_latency` 组内转化耗时对象，仅含 `min_seconds`、`max_seconds`、`mean_seconds` 三个字段，用于按组核对耗时。耗时口径与顶层 `conversion_latency` 完全一致、源自同一份配对归约：组内每个转化用户只贡献一个耗时——先在当前筛选条件的全部有效配对中选时间最早的有效 `signup`，再选能与它配对的最晚 `visit`，以两者的 UTC 时间差（秒）计，**不是**取该用户所有配对中的最短间隔。用户仍按最早合格 visit 的 UTC 日期归组，配对访问可以落在后一天，不据配对时间移动所属组；访问时段含起点、不含终点，段外访问不参与，注册可晚于时段终点；注册严格晚于访问，`--within-seconds` 上界含等值。`min_seconds`、`max_seconds` 为整数秒；`mean_seconds` 为**本组**转化用户耗时之和除以**本组**转化人数的算术平均，真除不取整或人为舍入（多组并存时可与顶层均值不同）。无转化的日期组三项均为 `null`，无合格访问时分组数组为空。该开关不依赖也不自动开启顶层耗时（仍由 `--include-latency` 单独控制）、组内配对或任何编号明细，原开关仍各自控制原字段；不传该开关时既有输出保持现状，该开关不改变任何汇总数值。单独使用（不带 `--group-by visit-date`）退出码 2、标准输出为空、标准错误指出该开关及依赖项，且先于数据库访问，不创建数据库或改动记录；数据库不存在或不可访问仍退出码 2、标准输出为空、标准错误含路径及原因
 - 转化比例 = 转化人数 / 访问人数；零访问时三项均为 0
+- `--output <路径>`：在打印之外把本次完整报告保存到指定 JSON 文件。保存的字段由本次全部参数共同决定（访问时段、转化时限、编号、配对、耗时与日期分组各自控制原有字段，数组顺序与数值和标准输出一致），文件解析后的内容与本次标准输出完全一致，不增加导出时间、路径或其他字段；空报告（零值、空数组、`null`）同样按现有规则保存。文件为 UTF-8 编码、单个 JSON 对象、以换行结束；相对路径按当前工作目录解释，父目录须事先存在，目标不存在时创建、已有普通文件时整体覆盖（不追加多个报告）。保存成功时退出码仍为 0，标准输出仍只打印原来的单行报告，标准错误为空。`--output` 缺少取值或取空字符串时退出码 2、标准输出为空、标准错误指出 `--output` 及原因，且在数据库访问前拒绝；输出路径与 `--db` 按当前系统规则规范化后得到同一绝对路径时同样提前拒绝并指出两个参数；父目录不存在、目标是目录或目标无法写入时退出码 2、标准输出为空、标准错误包含输出路径及原因。参数校验或报告查询失败时不创建或改写输出文件；保存失败时已有目标保留原内容，原本不存在的目标不留下不完整文件；上述失败均不改变数据库里的事件记录，数据库不存在或无法访问仍沿用原来的错误协议。不传 `--output` 时输出与错误行为保持现状
 
 ## 样例
 
@@ -105,5 +115,18 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 
 ```json
 {"imported": 5}
+{"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333}
+```
+
+加 `--output` 保存报告时：
+
+```sh
+python -m funnel import sample.jsonl --db events.sqlite
+python -m funnel report --db events.sqlite --output report.json
+```
+
+第一条命令导入 5 条事件；第二条命令的标准输出与 `report.json` 的内容一致，均为：
+
+```json
 {"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333}
 ```

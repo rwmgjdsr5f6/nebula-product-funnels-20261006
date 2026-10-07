@@ -8,6 +8,7 @@
                               [--include-latency]
                               [--group-by visit-date [--include-group-pairs]
                                                          [--include-group-latency]]
+                              [--output <report.json>]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -18,6 +19,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime
 
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
@@ -245,6 +247,62 @@ def parse_group_by(text):
     return text
 
 
+def parse_output_path(text):
+    """--output 取值校验：只拒绝空字符串，其余形态原样放行。
+
+    缺少取值由 argparse 自身以退出码 2 拒绝；空字符串在此拒绝，同样经
+    argparse 以退出码 2 结束（标准错误自带 --output 参数名前缀），且先于
+    一切数据库访问。路径是否存在、是否可写不在此检查——那些属于保存阶段
+    的判断（见 save_report），避免把文件系统状态混入参数形态校验。
+    """
+    if text == "":
+        raise argparse.ArgumentTypeError("输出路径不能为空字符串")
+    return text
+
+
+def _normalized_abspath(path):
+    """按当前系统规则规范化路径：相对路径按当前工作目录解析为绝对路径，
+    再经 normcase 做系统默认的大小写归一（如 Windows 不区分大小写）。
+    只用于 --output 与 --db 的同路径比较，不解析符号链接。
+    """
+    return os.path.normcase(os.path.abspath(path))
+
+
+def save_report(path, report_line):
+    """把单行报告 JSON 保存到 path：UTF-8 编码、单个 JSON 对象、以换行结束。
+
+    返回 None 表示成功；失败返回一行错误说明（含输出路径与原因），由调用
+    方打印到标准错误并以退出码 2 结束。
+
+    相对路径按当前工作目录解释；父目录须由使用者事先准备好，目标不存在时
+    创建，已有普通文件时整体覆盖（不追加多个报告）。写入先落到同目录临时
+    文件、再以 os.replace 原子替换目标：保存失败时已有目标保留原内容，
+    原本不存在的目标不会留下不完整文件（临时文件一并清理）。
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        return "%s: 父目录不存在: %s" % (path, parent)
+    if os.path.isdir(path):
+        return "%s: 输出目标是目录，无法写入报告文件" % path
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".funnel-report-", dir=parent)
+    except OSError as exc:
+        return "%s: 无法写入输出文件: %s" % (path, exc.strerror or exc)
+    try:
+        # 与标准输出完全相同的文本：同一行 JSON 加一个换行，不增加导出
+        # 时间、路径或任何其他字段。
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(report_line + "\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return "%s: 无法写入输出文件: %s" % (path, exc.strerror or exc)
+    return None
+
+
 def parse_visit_bound(text):
     """--visit-from / --visit-before 取值校验。
 
@@ -468,6 +526,21 @@ def cmd_report(args):
         )
         return 2
 
+    # --output 与 --db 不得指向同一文件：按当前系统规则规范化（相对路径按
+    # 当前工作目录解析、系统默认大小写归一）后得到同一绝对路径即拒绝，
+    # 同时指出两个参数；与上面的校验一样先于一切数据库访问，不创建数据库、
+    # 不改动记录，也不创建或改写输出文件。
+    if args.output is not None and _normalized_abspath(
+        args.output
+    ) == _normalized_abspath(args.db):
+        print(
+            "--output 与 --db 不能指向同一路径：规范化后得到同一绝对路径 %r"
+            "（--output %r、--db %r）"
+            % (_normalized_abspath(args.output), args.output, args.db),
+            file=sys.stderr,
+        )
+        return 2
+
     if not os.path.exists(args.db):
         print("%s: 数据库不存在" % args.db, file=sys.stderr)
         return 2
@@ -579,7 +652,16 @@ def cmd_report(args):
         payload["conversion_latency"] = conversion_latency
     if args.group_by == "visit-date":
         payload["visit_date_groups"] = visit_date_groups
-    print(json.dumps(payload))
+    report_line = json.dumps(payload)
+    if args.output is not None:
+        # 报告查询成功后才落盘：参数校验或查询失败时不会走到这里，输出文件
+        # 不会被创建或改写。保存失败时退出码 2、标准输出为空，标准错误含
+        # 输出路径及原因；已有目标保留原内容，新目标不留不完整文件。
+        error = save_report(args.output, report_line)
+        if error is not None:
+            print(error, file=sys.stderr)
+            return 2
+    print(report_line)
     return 0
 
 
@@ -671,6 +753,17 @@ def main(argv=None):
         "converted_user_ids，与 --include-group-pairs 合用时各组再追加组内 "
         "conversion_pairs，与 --include-group-latency 合用时各组再追加组内 "
         "conversion_latency；不传则输出不变",
+    )
+    p_report.add_argument(
+        "--output",
+        type=parse_output_path,
+        default=None,
+        metavar="REPORT.json",
+        help="把本次完整报告额外保存到该 JSON 文件（UTF-8、单个 JSON 对象、"
+        "以换行结束，内容与标准输出的单行报告完全一致，不增加任何字段）；"
+        "相对路径按当前工作目录解释，父目录须事先存在，目标不存在时创建、"
+        "已有普通文件时整体覆盖；标准输出仍只打印原来的单行报告，"
+        "不传则仅打印不保存",
     )
     p_report.set_defaults(func=cmd_report)
 

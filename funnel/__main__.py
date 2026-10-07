@@ -6,7 +6,8 @@
                                --visit-before YYYY-MM-DDTHH:MM:SS]
                               [--include-users] [--include-pairs]
                               [--include-latency]
-                              [--group-by visit-date [--include-group-pairs]]
+                              [--group-by visit-date [--include-group-pairs]
+                                                         [--include-group-latency]]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -320,7 +321,7 @@ def _pairs_payload(best_by_user, user_ids=None):
     ]
 
 
-def _latency_payload(best_by_user):
+def _latency_payload(best_by_user, user_ids=None):
     """由同一配对归约结果装配 conversion_latency 对象。
 
     每个转化用户只贡献一个耗时：直接取归约结果里该用户的那次配对
@@ -329,16 +330,20 @@ def _latency_payload(best_by_user):
     统一按 UTC 解释，用 strptime 求差（可移植且与配对 SQL 的
     strftime('%s') 口径一致）。
 
+    user_ids 为 None 时取全部转化用户（顶层口径），否则只取给定子集
+    （组内口径，调用方保证子集中的编号都在归约结果里）。
+
     min/max 为整数秒；mean 为总耗时除以转化人数的算术平均，真除不取整。
     无转化（含无访问）时三项均为 None。
     """
+    ids = best_by_user if user_ids is None else user_ids
     durations = [
         (
-            datetime.strptime(pair[0], TIMESTAMP_FORMAT)
-            - datetime.strptime(pair[1], TIMESTAMP_FORMAT)
+            datetime.strptime(best_by_user[user_id][0], TIMESTAMP_FORMAT)
+            - datetime.strptime(best_by_user[user_id][1], TIMESTAMP_FORMAT)
         ).total_seconds()
         # 归约结果中 visit 严格早于 signup，耗时恒为正整数秒。
-        for pair in best_by_user.values()
+        for user_id in ids
     ]
     if not durations:
         return {"min_seconds": None, "max_seconds": None, "mean_seconds": None}
@@ -351,7 +356,11 @@ def _latency_payload(best_by_user):
 
 
 def _build_visit_date_groups(
-    date_by_user, converted_user_ids, include_users, pairs_by_user=None
+    date_by_user,
+    converted_user_ids,
+    include_users,
+    pairs_by_user=None,
+    latency_by_user=None,
 ):
     """由归组映射与转化成员集合装配 visit_date_groups。
 
@@ -370,6 +379,14 @@ def _build_visit_date_groups(
     conversion_pairs：即本组转化成员在顶层同一归约结果中的配对子集。
     每个转化用户只归一个日期组，故各组配对合并排序后与顶层数组完全一致，
     组间不会重复用户；无转化的组得到空数组。
+
+    latency_by_user 非 None 时（--include-group-latency），每组再追加
+    conversion_latency：本组转化成员在同一归约结果中的耗时子集统计，
+    口径与顶层 conversion_latency 相同（min/max 整数秒，mean 本组耗时
+    之和除以本组转化人数，真除不取整）。两个开关各传各的同一份归约结果，
+    互不依赖：只开组内耗时时配对明细不出现，反之亦然。每个转化用户只归
+    一个日期组，故各组组内耗时的人数之和恰为总转化人数；无转化的组三项
+    均为 None。
     """
     converted_members = set(converted_user_ids)
     visit_ids_by_date = {}
@@ -395,6 +412,13 @@ def _build_visit_date_groups(
             # 组内配对与顶层共用同一归约结果，只按本组转化成员过滤；
             # 数组长度即本组转化人数，排序口径与顶层相同。
             group["conversion_pairs"] = _pairs_payload(pairs_by_user, converted_ids)
+        if latency_by_user is not None:
+            # 组内耗时与顶层共用同一归约结果，只按本组转化成员过滤；
+            # 空集合（无转化的组）自然得到三项 None，无合格访问时连组
+            # 都不会生成（分组数组为空）。
+            group["conversion_latency"] = _latency_payload(
+                latency_by_user, converted_ids
+            )
         groups.append(group)
     return groups
 
@@ -430,6 +454,16 @@ def cmd_report(args):
         print(
             "--include-group-pairs 必须与 --group-by visit-date 合用："
             "已提供 --include-group-pairs，缺少 --group-by visit-date",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --include-group-latency 同样只与 --group-by visit-date 合用，单独
+    # 提供时按参数错误处理，且先于一切数据库访问，不创建数据库、不改动记录。
+    if args.include_group_latency and args.group_by != "visit-date":
+        print(
+            "--include-group-latency 必须与 --group-by visit-date 合用："
+            "已提供 --include-group-latency，缺少 --group-by visit-date",
             file=sys.stderr,
         )
         return 2
@@ -472,12 +506,17 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
-            if args.include_pairs or args.include_group_pairs or args.include_latency:
+            if (
+                args.include_pairs
+                or args.include_group_pairs
+                or args.include_latency
+                or args.include_group_latency
+            ):
                 # 配对明细沿用与汇总完全相同的配对条件（同一 SQL，仅改
                 # select 列表），在 Python 侧归约且只归约一次：顶层数组、
-                # 整体耗时统计与各日期组的组内数组都从这一份结果装配，
-                # 三者天然勾稽——耗时逐人与顶层配对一一对应，各组配对
-                # 合并排序后也必与顶层数组完全一致。
+                # 整体耗时统计与各日期组的组内数组/组内耗时都从这一份
+                # 结果装配，它们天然勾稽——耗时逐人与顶层配对一一对应，
+                # 各组配对合并排序后也必与顶层数组完全一致。
                 best_by_user = _reduce_pairs(
                     conn.execute(
                         _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
@@ -497,7 +536,9 @@ def cmd_report(args):
                 #    且允许晚于段终点，--within-seconds 上界含等值。
                 # 组内编号数组只在同时启用 --include-users 时追加；
                 # --include-pairs 不向组内追加任何字段，组内配对明细由
-                # --include-group-pairs 单独控制（不自动开启顶层配对）。
+                # --include-group-pairs 单独控制（不自动开启顶层配对），
+                # 组内耗时由 --include-group-latency 单独控制（不自动
+                # 开启顶层耗时或组内配对）。
                 date_by_user = _qualifying_visit_date_by_user(
                     conn, visit_where, visit_params
                 )
@@ -513,6 +554,7 @@ def cmd_report(args):
                     converted_id_set,
                     args.include_users,
                     best_by_user if args.include_group_pairs else None,
+                    best_by_user if args.include_group_latency else None,
                 )
         finally:
             conn.close()
@@ -532,7 +574,8 @@ def cmd_report(args):
     if args.include_pairs:
         payload["conversion_pairs"] = conversion_pairs
     if args.include_latency:
-        # 只在顶层追加整体耗时对象；组内不追加任何耗时字段。
+        # 顶层整体耗时只由本开关控制；组内耗时由 --include-group-latency
+        # 单独控制，互不自动开启（见上方分组装配）。
         payload["conversion_latency"] = conversion_latency
     if args.group_by == "visit-date":
         payload["visit_date_groups"] = visit_date_groups
@@ -607,6 +650,17 @@ def main(argv=None):
         "升序）；不自动开启顶层配对或编号明细，单独使用则以退出码 2 拒绝",
     )
     p_report.add_argument(
+        "--include-group-latency",
+        action="store_true",
+        help="与 --group-by visit-date 合用时，每个日期组追加 conversion_latency "
+        "组内转化耗时对象（仅含 min_seconds、max_seconds、mean_seconds，"
+        "口径与顶层 conversion_latency 相同：每个转化用户只贡献一个耗时，"
+        "取最早有效 signup 与能配对它的最晚 visit 的 UTC 时间差）；"
+        "min/max 为整数秒，mean 为本组转化用户耗时之和除以人数，真除不取整，"
+        "无转化的组三项均为 null；不自动开启顶层耗时、配对或编号明细，"
+        "单独使用则以退出码 2 拒绝",
+    )
+    p_report.add_argument(
         "--group-by",
         type=parse_group_by,
         default=None,
@@ -615,7 +669,8 @@ def main(argv=None):
         "visit 的 UTC 日期，在原有 JSON 中追加 visit_date_groups 数组）；"
         "与 --include-users 合用时各组再追加组内 visit_user_ids 与 "
         "converted_user_ids，与 --include-group-pairs 合用时各组再追加组内 "
-        "conversion_pairs；不传则输出不变",
+        "conversion_pairs，与 --include-group-latency 合用时各组再追加组内 "
+        "conversion_latency；不传则输出不变",
     )
     p_report.set_defaults(func=cmd_report)
 

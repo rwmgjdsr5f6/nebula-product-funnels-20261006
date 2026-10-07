@@ -5,6 +5,7 @@
                               [--visit-from YYYY-MM-DDTHH:MM:SS
                                --visit-before YYYY-MM-DDTHH:MM:SS]
                               [--include-users] [--include-pairs]
+                              [--group-by visit-date]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -328,6 +329,45 @@ def cmd_report(args):
                     }
                     for user_id in sorted(best_by_user)
                 ]
+            if args.group_by == "visit-date":
+                # 按访问日期分组：先沿用与汇总完全相同的时段筛选（含起点、
+                # 不含终点；不传时段则全库），再把每个用户归到其最早合格
+                # visit 的 UTC 日期；段外历史不参与归组，每个用户编号只归
+                # 一个组。转化判定与汇总一致：可使用该用户任意合格访问配对
+                # （不限于归组用的那次），signup 严格晚于 visit、可晚于段
+                # 终点。时间戳为定宽 ISO 文本，前 10 个字符即 UTC 日期，
+                # 日期字符串的字典序升序即时间升序；重复事件与重复导入不
+                # 影响 MIN 与集合归约结果。
+                converted_id_set = set(
+                    row[0]
+                    for row in conn.execute(
+                        _converted_sql(args, "DISTINCT v.user_id"),
+                        _converted_params(args),
+                    )
+                )
+                group_visits = {}  # visit_date -> [visit_users, converted_users]
+                for user_id, first_visit_ts in conn.execute(
+                    "SELECT user_id, MIN(timestamp) FROM events "
+                    + visit_where
+                    + " GROUP BY user_id",
+                    visit_params,
+                ):
+                    visit_date = first_visit_ts[:10]
+                    counts = group_visits.setdefault(visit_date, [0, 0])
+                    counts[0] += 1
+                    if user_id in converted_id_set:
+                        counts[1] += 1
+                visit_date_groups = [
+                    {
+                        "visit_date": visit_date,
+                        "visit_users": counts[0],
+                        "converted_users": counts[1],
+                        "conversion_rate": (
+                            counts[1] / counts[0] if counts[0] else 0
+                        ),
+                    }
+                    for visit_date, counts in sorted(group_visits.items())
+                ]
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -345,6 +385,9 @@ def cmd_report(args):
         payload["converted_user_ids"] = converted_user_ids
     if args.include_pairs:
         payload["conversion_pairs"] = conversion_pairs
+    if args.group_by == "visit-date":
+        # 仅 --group-by visit-date 时追加分组数组；不传该参数时输出保持不变。
+        payload["visit_date_groups"] = visit_date_groups
     print(json.dumps(payload))
     return 0
 
@@ -396,6 +439,15 @@ def main(argv=None):
         help="在汇总之外追加 conversion_pairs 配对明细数组"
         "（每个转化用户一条：最早有效 signup 配对最晚有效 visit，"
         "按 user_id 原值的 Unicode 码点升序），不改变汇总数值",
+    )
+    p_report.add_argument(
+        "--group-by",
+        choices=["visit-date"],
+        default=None,
+        metavar="DIMENSION",
+        help="按维度追加分组结果；目前仅支持 visit-date"
+        "（按最早合格 visit 的 UTC 日期分组，追加 visit_date_groups 数组）；"
+        "不传则输出不变",
     )
     p_report.set_defaults(func=cmd_report)
 

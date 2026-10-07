@@ -366,22 +366,39 @@ def cmd_report(args):
                 )
                 visits_by_date = {}
                 converted_by_date = {}
+                # --include-users 同时启用时，按组收集编号明细；只开启分组时
+                # 不收集，组内字段维持现状。
+                visit_ids_by_date = {}
+                converted_ids_by_date = {}
                 for user_id, day in date_by_user.items():
                     visits_by_date[day] = visits_by_date.get(day, 0) + 1
+                    if args.include_users:
+                        visit_ids_by_date.setdefault(day, []).append(user_id)
                     if user_id in converted_id_set:
                         converted_by_date[day] = converted_by_date.get(day, 0) + 1
+                        if args.include_users:
+                            converted_ids_by_date.setdefault(day, []).append(user_id)
                 # 只列出有访问用户的日期，按日期升序；各组两种人数之和
                 # 分别等于汇总人数。无合格访问时数组为空。
-                visit_date_groups = [
-                    {
+                visit_date_groups = []
+                for day in sorted(visits_by_date):
+                    group = {
                         "visit_date": day,
                         "visit_users": visits_by_date[day],
                         "converted_users": converted_by_date.get(day, 0),
                         "conversion_rate": converted_by_date.get(day, 0)
                         / visits_by_date[day],
                     }
-                    for day in sorted(visits_by_date)
-                ]
+                    if args.include_users:
+                        # 组内编号明细：按 user_id 原值去重（每人只归一个组，
+                        # 天然无重复），排序在 Python 侧进行，str 比较即
+                        # Unicode 码点字典序。转化数组是本组访问数组的子集，
+                        # 无转化的组为空数组；各组数组合并后等于顶层相应数组。
+                        group["visit_user_ids"] = sorted(visit_ids_by_date[day])
+                        group["converted_user_ids"] = sorted(
+                            converted_ids_by_date.get(day, [])
+                        )
+                    visit_date_groups.append(group)
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -444,7 +461,8 @@ def main(argv=None):
         "--include-users",
         action="store_true",
         help="在汇总之外追加 visit_user_ids 与 converted_user_ids 两个编号数组"
-        "（按 user_id 原值去重，按 Unicode 码点升序），不改变汇总数值",
+        "（按 user_id 原值去重，按 Unicode 码点升序），不改变汇总数值；"
+        "与 --group-by visit-date 同用时，各日期组内追加同名的组内编号数组",
     )
     p_report.add_argument(
         "--include-pairs",

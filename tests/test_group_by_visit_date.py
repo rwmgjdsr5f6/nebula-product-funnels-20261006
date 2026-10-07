@@ -58,6 +58,12 @@ EXPECTED_GROUP_KEYS = {
     "conversion_rate",
 }
 
+# --group-by visit-date 与 --include-users 同时启用时，组内追加的编号明细字段。
+EXPECTED_GROUP_ID_KEYS = EXPECTED_GROUP_KEYS | {
+    "visit_user_ids",
+    "converted_user_ids",
+}
+
 
 def run_funnel(*cli_args):
     """在项目目录执行 python -m funnel，返回完成的进程结果。"""
@@ -117,17 +123,34 @@ class FunnelGroupByVisitDateTests(unittest.TestCase):
         assert isinstance(obj, dict), "标准输出不是 JSON 对象: %r" % stdout
         return obj
 
-    def assertGroups(self, payload, expected):
-        """expected 为 (visit_date, visit_users, converted_users, rate) 元组列表。"""
+    def assertGroups(self, payload, expected, expected_ids=None):
+        """expected 为 (visit_date, visit_users, converted_users, rate) 元组列表。
+
+        expected_ids 提供时（--include-users 同时启用的场景），逐项核对组内
+        (visit_user_ids, converted_user_ids)，并检查组间合并关系。
+        """
         groups = payload["visit_date_groups"]
         self.assertIsInstance(groups, list)
         self.assertEqual(len(groups), len(expected))
-        for group, (day, visits, converted, rate) in zip(groups, expected):
-            self.assertEqual(set(group), EXPECTED_GROUP_KEYS)
+        want_keys = (
+            EXPECTED_GROUP_ID_KEYS if expected_ids is not None else EXPECTED_GROUP_KEYS
+        )
+        for index, (group, (day, visits, converted, rate)) in enumerate(
+            zip(groups, expected)
+        ):
+            self.assertEqual(set(group), want_keys)
             self.assertEqual(group["visit_date"], day)
             self.assertEqual(group["visit_users"], visits)
             self.assertEqual(group["converted_users"], converted)
             self.assertEqual(group["conversion_rate"], rate)
+            if expected_ids is not None:
+                visit_ids, converted_ids = expected_ids[index]
+                self.assertEqual(group["visit_user_ids"], visit_ids)
+                self.assertEqual(group["converted_user_ids"], converted_ids)
+                # 数组长度等于对应人数；转化数组是本组访问数组的子集。
+                self.assertEqual(len(visit_ids), visits)
+                self.assertEqual(len(converted_ids), converted)
+                self.assertLessEqual(set(converted_ids), set(visit_ids))
         # 按日期升序，且各组两种人数之和分别等于汇总人数。
         days = [group["visit_date"] for group in groups]
         self.assertEqual(days, sorted(days))
@@ -138,6 +161,16 @@ class FunnelGroupByVisitDateTests(unittest.TestCase):
             sum(group["converted_users"] for group in groups),
             payload["converted_users"],
         )
+        if expected_ids is not None:
+            # 各组两类编号分别合并（排序后）等于顶层相应数组，组间没有重复编号。
+            merged_visits = [uid for g in groups for uid in g["visit_user_ids"]]
+            merged_converted = [
+                uid for g in groups for uid in g["converted_user_ids"]
+            ]
+            self.assertEqual(sorted(merged_visits), payload["visit_user_ids"])
+            self.assertEqual(sorted(merged_converted), payload["converted_user_ids"])
+            self.assertEqual(len(merged_visits), len(set(merged_visits)))
+            self.assertEqual(len(merged_converted), len(set(merged_converted)))
 
     def snapshot_events(self, db):
         with sqlite3.connect(db) as conn:
@@ -333,6 +366,91 @@ class FunnelGroupByVisitDateTests(unittest.TestCase):
         self.assertGroups(
             payload,
             [("2026-10-06", 2, 1, 0.5), ("2026-10-07", 1, 0, 0)],
+            expected_ids=[(["u1", "u2"], ["u1"]), (["u3"], [])],
+        )
+        # --include-pairs 不向组内追加配对明细。
+        for group in payload["visit_date_groups"]:
+            self.assertNotIn("conversion_pairs", group)
+
+    # -- 组内编号明细（--group-by visit-date 与 --include-users 同开） ------
+
+    def test_acceptance_group_user_ids_within_60(self):
+        # 验收样例：六日组 ["u1","u2"] 与 ["u1"]，七日组 ["u3"] 与 []。
+        db = self.import_events(ACCEPTANCE_EVENTS)
+        result = self.report(
+            db, "--group-by", "visit-date", "--include-users",
+            "--within-seconds", "60",
+        )
+        self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertEqual(payload["visit_users"], 3)
+        self.assertEqual(payload["converted_users"], 1)
+        self.assertEqual(payload["visit_user_ids"], ["u1", "u2", "u3"])
+        self.assertEqual(payload["converted_user_ids"], ["u1"])
+        self.assertGroups(
+            payload,
+            [("2026-10-06", 2, 1, 0.5), ("2026-10-07", 1, 0, 0)],
+            expected_ids=[(["u1", "u2"], ["u1"]), (["u3"], [])],
+        )
+
+    def test_group_user_ids_shuffled_and_reimport_invariant(self):
+        # 打乱行序与重复导入不改变组内编号明细。
+        path = self.write_jsonl("shuffled.jsonl", SHUFFLED_EVENTS)
+        db = self.db_path("shuffled.sqlite")
+        self.assertEqual(run_funnel("import", path, "--db", db).returncode, 0)
+        self.assertEqual(run_funnel("import", path, "--db", db).returncode, 0)
+        result = self.report(
+            db, "--group-by", "visit-date", "--include-users",
+            "--within-seconds", "60",
+        )
+        self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertGroups(
+            payload,
+            [("2026-10-06", 2, 1, 0.5), ("2026-10-07", 1, 0, 0)],
+            expected_ids=[(["u1", "u2"], ["u1"]), (["u3"], [])],
+        )
+
+    def test_group_user_ids_empty_groups_stay_empty(self):
+        # 无合格访问时分组数组为空，不补空日期，也没有组内编号字段可核对。
+        db = self.import_events(SIGNUP_ONLY_EVENTS, jsonl_name="signup_only.jsonl")
+        result = self.report(db, "--group-by", "visit-date", "--include-users")
+        self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertEqual(payload["visit_date_groups"], [])
+        self.assertEqual(payload["visit_user_ids"], [])
+        self.assertEqual(payload["converted_user_ids"], [])
+
+    def test_group_by_without_include_users_keeps_group_shape(self):
+        # 只开启分组时，组内不出现编号字段。
+        db = self.import_events(ACCEPTANCE_EVENTS)
+        result = self.report(db, "--group-by", "visit-date", "--within-seconds", "60")
+        self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertNotIn("visit_user_ids", payload)
+        for group in payload["visit_date_groups"]:
+            self.assertEqual(set(group), EXPECTED_GROUP_KEYS)
+
+    def test_group_user_ids_sorted_by_codepoint(self):
+        # 组内编号按 Unicode 码点升序，保留大小写与中文。
+        events = [
+            {"user_id": "b", "event": "visit", "timestamp": "2026-10-06T10:00:00"},
+            {"user_id": "A", "event": "visit", "timestamp": "2026-10-06T11:00:00"},
+            {"user_id": "中", "event": "visit", "timestamp": "2026-10-06T12:00:00"},
+            {"user_id": "中", "event": "signup", "timestamp": "2026-10-06T12:00:30"},
+        ]
+        db = self.import_events(events)
+        result = self.report(
+            db, "--group-by", "visit-date", "--include-users",
+            "--within-seconds", "60",
+        )
+        self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
+        payload = self.parse_single_json_object(result.stdout)
+        self.assertGroups(
+            payload,
+            [("2026-10-06", 3, 1, 1 / 3)],
+            expected_ids=[(["A", "b", "中"], ["中"])],
         )
 
     # -- 非法 --group-by 取值 ----------------------------------------------

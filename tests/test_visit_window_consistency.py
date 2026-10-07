@@ -68,6 +68,10 @@ EXPECTED_GROUPS_59 = [
     ("2026-10-06", 2, 0, 0),
     ("2026-10-07", 1, 0, 0),
 ]
+# 每组 (visit_user_ids, converted_user_ids)：6 日组 u1、u4，转化仅 u1；
+# 7 日组仅 u2（同刻注册不转化）。59 秒下访问归组不变，转化数组全空。
+EXPECTED_GROUP_IDS_60 = [(["u1", "u4"], ["u1"]), (["u2"], [])]
+EXPECTED_GROUP_IDS_59 = [(["u1", "u4"], []), (["u2"], [])]
 
 METRIC_KEYS = {"visit_users", "converted_users", "conversion_rate"}
 FULL_KEYS = METRIC_KEYS | {
@@ -77,6 +81,8 @@ FULL_KEYS = METRIC_KEYS | {
     "visit_date_groups",
 }
 GROUP_KEYS = {"visit_date", "visit_users", "converted_users", "conversion_rate"}
+# full_report 同时带 --include-users：每个日期组追加两个组内编号数组。
+GROUP_KEYS_WITH_IDS = GROUP_KEYS | {"visit_user_ids", "converted_user_ids"}
 PAIR_KEYS = {"user_id", "visit_timestamp", "signup_timestamp"}
 
 
@@ -159,17 +165,34 @@ class VisitWindowConsistencyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg="stderr=%r" % result.stderr)
         self.assertEqual(result.stderr, "")
 
-    def assertGroups(self, payload, expected):
-        """expected 为 (visit_date, visit_users, converted_users, rate) 元组列表。"""
+    def assertGroups(self, payload, expected, expected_group_ids=None):
+        """expected 为 (visit_date, visit_users, converted_users, rate) 元组列表。
+
+        full_report 固定带 --include-users，故组对象必含组内编号数组；
+        expected_group_ids 与 expected 等长，每项为
+        (visit_user_ids, converted_user_ids)。
+        """
         groups = payload["visit_date_groups"]
         self.assertIsInstance(groups, list)
         self.assertEqual(len(groups), len(expected))
-        for group, (day, visits, converted, rate) in zip(groups, expected):
-            self.assertEqual(set(group), GROUP_KEYS)
+        if expected_group_ids is not None:
+            self.assertEqual(len(expected_group_ids), len(expected))
+        for index, (group, item) in enumerate(zip(groups, expected)):
+            day, visits, converted, rate = item
+            self.assertEqual(set(group), GROUP_KEYS_WITH_IDS)
             self.assertEqual(group["visit_date"], day)
             self.assertEqual(group["visit_users"], visits)
             self.assertEqual(group["converted_users"], converted)
             self.assertEqual(group["conversion_rate"], rate)
+            if expected_group_ids is not None:
+                visit_ids, converted_ids = expected_group_ids[index]
+                self.assertEqual(group["visit_user_ids"], visit_ids)
+                self.assertEqual(group["converted_user_ids"], converted_ids)
+                self.assertEqual(len(visit_ids), visits)
+                self.assertEqual(len(converted_ids), converted)
+                self.assertTrue(set(converted_ids) <= set(visit_ids))
+                self.assertEqual(visit_ids, sorted(visit_ids))
+                self.assertEqual(converted_ids, sorted(converted_ids))
         # 按日期升序，且各组两种人数之和分别等于汇总人数。
         days = [group["visit_date"] for group in groups]
         self.assertEqual(days, sorted(days))
@@ -180,6 +203,24 @@ class VisitWindowConsistencyTests(unittest.TestCase):
             sum(group["converted_users"] for group in groups),
             payload["converted_users"],
         )
+        if expected_group_ids is not None:
+            # 各组编号集合并后等于顶层相应数组；长度和相等即组间无重复编号。
+            visit_sets = [set(g["visit_user_ids"]) for g in groups]
+            converted_sets = [set(g["converted_user_ids"]) for g in groups]
+            self.assertEqual(
+                set().union(*visit_sets), set(payload["visit_user_ids"])
+            )
+            self.assertEqual(
+                set().union(*converted_sets), set(payload["converted_user_ids"])
+            )
+            self.assertEqual(
+                sum(len(ids) for ids in visit_sets),
+                len(payload["visit_user_ids"]),
+            )
+            self.assertEqual(
+                sum(len(ids) for ids in converted_sets),
+                len(payload["converted_user_ids"]),
+            )
 
     def snapshot_events(self, db):
         """报告只读：逐行快照全部事件记录。"""
@@ -231,7 +272,11 @@ class VisitWindowConsistencyTests(unittest.TestCase):
 
         # 分组：u1 段外有 5 日历史，仍按段内最早 visit 归 6 日组；
         # 6 日组访问 2 人转化 1 人比例 0.5，7 日组访问 1 人转化 0 人。
-        self.assertGroups(payload, EXPECTED_GROUPS_60)
+        self.assertGroups(
+            payload,
+            EXPECTED_GROUPS_60,
+            expected_group_ids=EXPECTED_GROUP_IDS_60,
+        )
 
     def test_edge_rules_unchanged_under_window(self):
         """段外历史、终点访问、同刻注册均按原规则处理。"""
@@ -267,7 +312,11 @@ class VisitWindowConsistencyTests(unittest.TestCase):
         self.assertEqual(payload["visit_user_ids"], EXPECTED_VISIT_IDS)
         self.assertEqual(payload["converted_user_ids"], [])
         self.assertEqual(payload["conversion_pairs"], [])
-        self.assertGroups(payload, EXPECTED_GROUPS_59)
+        self.assertGroups(
+            payload,
+            EXPECTED_GROUPS_59,
+            expected_group_ids=EXPECTED_GROUP_IDS_59,
+        )
 
     # -- 60 与 59 秒下明细开关不改变汇总数值 ------------------------------
 

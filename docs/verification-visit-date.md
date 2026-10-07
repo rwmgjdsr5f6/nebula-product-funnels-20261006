@@ -1,11 +1,13 @@
 # 按访问日期分组报告（--group-by visit-date）：源码行为核对说明
 
 核对日期：2026-10-07
-核对基线：当前工作树，HEAD `78356d5`，撰写前工作树干净。
+核对基线：HEAD `eac2a23`；本次在其上扩展组内编号明细（`--group-by
+visit-date` 与 `--include-users` 同开时，组对象追加 `visit_user_ids` 与
+`converted_user_ids`），撰写时改动尚未提交。
 
 ## 1. 核对依据与范围
 
-本说明只覆盖一条**已有**报告流程的分组部分：
+本说明覆盖分组报告流程，并重点覆盖本次扩展的**组内编号明细**：
 
 ```sh
 python -m funnel import <events.jsonl> --db <events.sqlite>
@@ -17,14 +19,16 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
 
 目的是让复核者用一份小型合成输入，从公开入口一路追到 `visit_date_groups`
 数组，逐人核对"谁被归到哪一天、谁算该组转化、组内人数与汇总和两种明细之间
-是什么关系"。结论全部指向当前仓库的真实文件、函数与条件；本说明不要求也不
-描述任何功能变更，现有命令、输出字段、SQLite 结构、追加导入语义、报告不改写
-事件记录的行为均保持现状。
+是什么关系"；本次扩展后还能直接核对**每个日期组内逐人的访问编号与转化
+编号**。结论全部指向当前仓库的真实文件、函数与条件。除组内两数组外，
+现有命令、输出字段、SQLite 结构、追加导入语义、报告不改写事件记录的行为
+均保持现状；只开启分组或只开启 `--include-users` 时输出字段维持现状，
+`--include-pairs` 不向组内追加配对。
 
 | 文件 | 内容 |
 |---|---|
 | `funnel/__main__.py` | 全部实现：CLI 入口、JSONL 校验、SQLite 读写、漏斗 SQL、归组与输出 |
-| `tests/test_group_by_visit_date.py` | 分组报告的 16 个回归测试（验收样例、归组语义、不变量、参数拒绝） |
+| `tests/test_group_by_visit_date.py` | 分组报告的 25 个回归测试（验收样例、归组语义、组内编号明细、不变量、参数拒绝） |
 | `docs/verification-visit-window.md` | 访问时段与转化时限的核对说明（姊妹篇） |
 | `docs/verification-conversion-pairs.md` | 配对与编号明细的核对说明（姊妹篇） |
 | `docs/verification-jsonl-funnel.md` | 导入与基础报告的核对说明（姊妹篇） |
@@ -40,22 +44,22 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
 | `_converted_sql` / `_converted_params` | 189–217 | 转化查询 SQL 与参数装配（分组与汇总共用） |
 | `parse_group_by` | 220–230 | `--group-by` 取值校验（只接受 `visit-date`） |
 | `parse_visit_bound` | 233–250 | `--visit-from` / `--visit-before` 取值校验 |
-| `cmd_report` | 253–405 | `report` 子命令：参数检查、查询、归组、JSON 输出 |
+| `cmd_report` | 253–422 | `report` 子命令：参数检查、查询、归组、JSON 输出 |
 | `cmd_report` 中 `--include-users` 块 | 302–319 | 编号明细：与汇总同一 SQL，Python 侧排序 |
 | `cmd_report` 中 `--include-pairs` 块 | 320–344 | 配对明细：与汇总同一 SQL，Python 侧归约 |
-| `cmd_report` 中 `--group-by` 块 | 345–384 | 归组查询、集合判定、按日期汇总与排序 |
-| `main` | 408–468 | argparse 子命令与参数装配（`--group-by` 在 456–464） |
+| `cmd_report` 中 `--group-by` 块 | 345–401 | 归组查询、集合判定、按日期汇总、组内编号归集与排序 |
+| `main` | 425–485 | argparse 子命令与参数装配（`--group-by` 在 475–483） |
 
 **数值来源声明（两种标记）：**
 
 - 标 **【实测】** 的命令输出、退出码与标准错误文本，是 2026-10-07 在本机
-  （Linux/WSL2，Python 3.14.4）以当前工作树源码实际执行的观测结果；`funnel`
+  （Linux/WSL2）以当前工作树源码实际执行的观测结果；`funnel`
   包经项目根目录解析，样例数据放在临时目录，与"在项目根目录执行下文命令"
   等价。
 - 其余结论标 **【源码推导】**，依据为 `funnel/__main__.py` 当前源码（含其
   SQL 与 Python 表达式）及 CPython 标准库 `json`/`argparse`/`sqlite3` 的
   行为；凡 `tests/test_group_by_visit_date.py` 中已有断言覆盖的，同时注明
-  测试名。该测试文件本次已**整体执行一遍，16 个用例全部通过**
+  测试名。该测试文件本次已**整体执行一遍，25 个用例全部通过**
   （`python3 -m unittest tests.test_group_by_visit_date`，OK）。
 - 若实际观察与本文推导冲突，以实际观察为准并据此修正本文，而不是反过来。
 
@@ -64,9 +68,9 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
 以下每一步均可直接在源码中核对，串联起来就是分组报告的完整链路：
 
 1. **公开入口与参数解析。** `python -m funnel report` 由 `main`
-   （`:408-468`）装配；`--group-by` 带一个取值，合法值只有 `visit-date`
-   （`type=parse_group_by`，`:456-464`）。参数解析在 `parse_args`
-   （`:467`）完成，非法取值在此阶段即以退出码 2 拒绝，**先于
+   （`:425-487`）装配；`--group-by` 带一个取值，合法值只有 `visit-date`
+   （`type=parse_group_by`，`:475-483`）。参数解析在 `parse_args`
+   （`:486`）完成，非法取值在此阶段即以退出码 2 拒绝，**先于
    `cmd_report` 运行，更先于任何数据库访问**（见第 8 节）。
 2. **时段参数先检查、数据库后打开。** `cmd_report`（`:253`）先完成
    `--visit-from/--visit-before` 成对与先后检查（`:256-275`），再做
@@ -97,15 +101,19 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
    `converted_users`（`:299-301`）是**同一函数、同一筛选条件**。配对语义
    见第 3 节：signup 严格晚于 visit、可使用任意合格 visit、可晚于时段终点、
    时限上界含等值。
-6. **按日期点人数并排序。** 遍历 `date_by_user`（`:367-372`）：每组访问
-   人数 +1；该用户在转化集合中则该组转化人数 +1。最后按日期升序展开
-   `visit_date_groups`（`:375-384`，键为 `sorted(visits_by_date)`；定宽
-   日期文本的字典序即时间先后）。
-7. **输出装配。** 汇总三字段在前（`:392-396`），随后按开关追加
-   `visit_user_ids`/`converted_user_ids`（`:397-399`）、
-   `conversion_pairs`（`:400-401`），最后在 `--group-by visit-date` 时
-   追加 `visit_date_groups`（`:402-403`），由 `json.dumps` 单行打印
-   （`:404`）。不传 `--group-by` 时 `args.group_by is None`，该数组
+6. **按日期点人数、归集组内编号并排序。** 遍历 `date_by_user`
+   （`:367-380`）：每组访问人数 +1，同时把编号加入
+   `visit_ids_by_date[day]` 集合（`:372-376`）；该用户在转化集合中则该组
+   转化人数 +1、编号加入 `converted_ids_by_date[day]`
+   （`:377-379`）。最后按日期升序逐日构造组对象
+   （`:385-401`，键为 `sorted(visits_by_date)`；定宽日期文本的字典序即
+   时间先后），仅在 `args.include_users` 为真时追加两个组内编号数组
+   （`:393-400`），排序与去重口径见第 3 节第 11 条。
+7. **输出装配。** 汇总三字段在前（`:408-412`），随后按开关追加
+   `visit_user_ids`/`converted_user_ids`（`:413-415`）、
+   `conversion_pairs`（`:416-417`），最后在 `--group-by visit-date` 时
+   追加 `visit_date_groups`（`:419-420`），由 `json.dumps` 单行打印
+   （`:421`）。不传 `--group-by` 时 `args.group_by is None`，该数组
    **不出现在输出中**。
 
 ## 3. 分组与转化语义（逐条可在源码核对）
@@ -120,7 +128,8 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
 3. **转化可使用任意合格访问，不限于归组那次。** 转化集合来自独立的
    `_converted_sql` 自连接枚举（`:360-366`、`:189-208`），与 `MIN` 归组
    互不约束：只要该用户**任意一次**合格 visit 能与某次 signup 构成有效配对，
-   他就在转化集合中，所在日期组（按最早 visit 归的那组）转化人数 +1。
+   他就在转化集合中，所在日期组（按最早 visit 归的那组）转化人数 +1、
+   转化编号加入该组。
 4. **signup 严格晚于 visit。** 配对条件是 `s.timestamp > v.timestamp`
    （`:198`）；同一时刻不成立，逆序不成立。
 5. **时限上界包含等值。** 带 `--within-seconds N` 时追加秒差
@@ -135,21 +144,45 @@ python -m funnel report --db <events.sqlite> [--within-seconds N]
    两天后 signup 仍算组内转化）。
 7. **日期组升序、只出现有访问用户的日期。** 日期键全部来自
    `date_by_user`（即至少有一次合格 visit 的用户），没有任何合格 visit 的
-   日期不会出现；输出顺序为 `sorted(visits_by_date)`（`:383`）。
+   日期不会出现；输出顺序为 `sorted(visits_by_date)`（`:386`）。
 8. **两种人数的分组总和分别等于汇总。** 归组把分母用户集合（与
    `visit_users` 同条件的 `DISTINCT user_id`）按日期**划分**，故
    `Σ visit_users = visit_users`；转化用户集合（与 `converted_users`
    同源）按其归组日期计数，故 `Σ converted_users = converted_users`。
-   该等式同时被 `assertGroups` 断言（测试文件 `:131-140`）。
+   该等式同时被 `assertGroups` 断言（测试文件 `:174-183`）。
 9. **组内比例按组内人数计算。**
    `conversion_rate = converted_by_date.get(day, 0) / visits_by_date[day]`
-   （`:380-381`）真除法。出现的日期必有访问，分母不为 0；该组无转化时
+   （`:390-392`）真除法。出现的日期必有访问，分母不为 0；该组无转化时
    数值为 0，JSON 文本是 `0.0`（`0 / 正整数` 为浮点）。
 10. **无合格访问时数组为空。** 没有任何合格 visit 时 `date_by_user` 与
-    `visits_by_date` 均为空，列表推导结果为 `[]`（`:375-384`），汇总为
-    `visit_users = 0` 且顶层比例为整数 `0`（`:391`）。回归：
+    `visits_by_date` 均为空，`visit_date_groups` 列表为空（`:385-401`），
+    汇总为 `visit_users = 0` 且顶层比例为整数 `0`（`:408`）。回归：
     `test_no_qualifying_visits_gives_empty_groups`（只有 signup 的用户）、
-    `test_window_without_visits_gives_empty_groups`（时段内无人访问）。
+    `test_window_without_visits_gives_empty_groups`（时段内无人访问）；
+    同开 `--include-users` 时由
+    `test_group_ids_empty_when_no_qualifying_visits` 固定为顶层两数组与
+    分组数组均为空、不补空日期。
+11. **组内编号明细仅在两开关同开时追加。** 仅当
+    `args.group_by == "visit-date"` 且 `args.include_users` 为真，每个组
+    对象才在四个现有字段后追加 `visit_user_ids` 与 `converted_user_ids`
+    （`:393-400`）；只开分组时组对象恰为四键
+    （`test_group_without_include_users_has_no_id_fields`），
+    `--include-pairs` 不向组内追加任何字段
+    （`test_include_pairs_does_not_add_pair_fields_to_groups`）。
+    归集发生在遍历 `date_by_user` 时（`:372-379`）：每用户恰有一个归组
+    日期，加入对应集合即天然按 `user_id` 原值去重，重复事件与重复导入不
+    产生重复编号；组内转化用户必在本组访问集合中（转化集合是访问用户的
+    子集，第 3 条同源）。输出前各集合经 `sorted()` 排序
+    （`:394-399`），与顶层编号数组（`:306-319`）同一口径：Python `str`
+    比较即 Unicode 码点字典序，**区分大小写、保留空白与中文、不按数字
+    大小**。数组长度分别等于该组两种人数；各组两类编号分别取集合并后等于
+    顶层相应数组，且各组长度之和等于顶层数组长度（即**组间没有重复
+    编号**）——这两条勾稽由 `assertGroups(group_ids=...)` 统一断言。
+    无转化的组 `converted_ids_by_date` 无该日键，经
+    `get(day, set())` 输出空数组（`:399`）。码点排序与原值保留由
+    `test_group_ids_sorted_by_code_point_and_keep_raw_values` 固定
+    （6 日组含 `" 空格"`、`"Alice"`、`"alice"`、`"u10"`、`"张三"`，
+    7 日组为 `"u2"`：跨组不能按拼接顺序对账，故勾稽按集合进行）。
 
 ## 4. 固定合成样例（2026 年 10 月，六条事件）
 
@@ -231,7 +264,7 @@ python -m funnel report --db events.sqlite --group-by visit-date --within-second
   （`:198`）不成立，间隔 0 秒也不可能满足时限；计入 7 日组访问人数，
   不计转化。
 - **分子 `converted_users = 1`**，**顶层比例 `1/3`** 真除法序列化即
-  `0.3333333333333333`（`:391`）。
+  `0.3333333333333333`（`:408`）。
 
 ### 6.3 两组数值与勾稽
 
@@ -243,7 +276,33 @@ python -m funnel report --db events.sqlite --group-by visit-date --within-second
 - 数组按日期升序；只出现有访问用户的两个日期（第 3 节第 7 条）。
 - 人数勾稽：`2 + 1 = 3 = visit_users`；`1 + 0 = 1 = converted_users`。
 - 7 日组比例的数值是 0；因 `0 / 1` 走真除法分支，JSON 文本为 **`0.0`**
-  而非 `0`（整数 `0` 只在零访问的顶层 `else` 分支出现，`:391`）。
+  而非 `0`（整数 `0` 只在零访问的顶层 `else` 分支出现，`:408`）。
+
+### 6.4 验收命令：同开 `--include-users`，组内逐人编号
+
+任务指定的验收命令为：
+
+```sh
+python -m funnel report --db events.sqlite --group-by visit-date --include-users --within-seconds 60
+```
+
+**【实测】** 完整预期标准输出（一行，退出码 0，标准错误为空）：
+
+```json
+{"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333, "visit_user_ids": ["u1", "u2", "u3"], "converted_user_ids": ["u1"], "visit_date_groups": [{"visit_date": "2026-10-06", "visit_users": 2, "converted_users": 1, "conversion_rate": 0.5, "visit_user_ids": ["u1", "u2"], "converted_user_ids": ["u1"]}, {"visit_date": "2026-10-07", "visit_users": 1, "converted_users": 0, "conversion_rate": 0.0, "visit_user_ids": ["u3"], "converted_user_ids": []}]}
+```
+
+对应测试：`test_acceptance_group_user_ids_within_60`。
+
+- **6 日组**：`visit_user_ids = ["u1","u2"]`、
+  `converted_user_ids = ["u1"]`；**7 日组**：
+  `visit_user_ids = ["u3"]`、`converted_user_ids = []`（u3 同刻注册，
+  第 6.2 节）。
+- 每组两数组长度等于该组两种人数；组内转化数组是本组访问数组的子集；
+  7 日组无转化，转化数组为空而非缺键（第 3 节第 11 条）。
+- 勾稽：`["u1","u2"] ∪ ["u3"] = ["u1","u2","u3"]`（顶层），
+  `["u1"] ∪ [] = ["u1"]`（顶层）；两组无重复编号，u1 虽在 7 日也有
+  visit，其编号只出现在 6 日组。
 
 ## 7. 只保留 7 日 UTC 全天访问（时段报告）
 
@@ -275,7 +334,8 @@ python -m funnel report --db events.sqlite --group-by visit-date \
 ## 8. 分组与用户编号、配对明细的关系
 
 `--group-by` 与 `--include-users`、`--include-pairs` 可叠加；三者共用同
-一组筛选条件，分组只在顶层**追加**数组（`:397-403`）。
+一组筛选条件，分组在顶层**追加**数组（`:414-420`），且两开关同开时编号
+明细同时进入组内（第 3 节第 11 条）。
 
 ```sh
 python -m funnel report --db events.sqlite --group-by visit-date \
@@ -285,22 +345,25 @@ python -m funnel report --db events.sqlite --group-by visit-date \
 **【实测】** 完整预期标准输出（字段顺序即 `payload` 装配顺序）：
 
 ```json
-{"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333, "visit_user_ids": ["u1", "u2", "u3"], "converted_user_ids": ["u1"], "conversion_pairs": [{"user_id": "u1", "visit_timestamp": "2026-10-07T10:00:00", "signup_timestamp": "2026-10-07T10:00:30"}], "visit_date_groups": [{"visit_date": "2026-10-06", "visit_users": 2, "converted_users": 1, "conversion_rate": 0.5}, {"visit_date": "2026-10-07", "visit_users": 1, "converted_users": 0, "conversion_rate": 0.0}]}
+{"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333, "visit_user_ids": ["u1", "u2", "u3"], "converted_user_ids": ["u1"], "conversion_pairs": [{"user_id": "u1", "visit_timestamp": "2026-10-07T10:00:00", "signup_timestamp": "2026-10-07T10:00:30"}], "visit_date_groups": [{"visit_date": "2026-10-06", "visit_users": 2, "converted_users": 1, "conversion_rate": 0.5, "visit_user_ids": ["u1", "u2"], "converted_user_ids": ["u1"]}, {"visit_date": "2026-10-07", "visit_users": 1, "converted_users": 0, "conversion_rate": 0.0, "visit_user_ids": ["u3"], "converted_user_ids": []}]}
 ```
 
 对应测试：`test_groups_coexist_with_include_users_and_pairs`。
 
 - **编号集合 = 被分组用户集合。** `visit_user_ids` 与归组查询使用同一
   `visit_where`（`:306-312` 对 `:350-357`），故
-  `["u1", "u2", "u3"]` 恰好是两个日期组所划分用户的并集；
+  `["u1", "u2", "u3"]` 恰好是两个日期组内 `visit_user_ids` 的并集；
   `converted_user_ids`（`:313-319`）与分组用的 `converted_id_set`
-  同源，均为 `["u1"]`。
-- **配对明细不要求是归组那次 visit。** u1 的配对是
+  同源，均为 `["u1"]`，也等于各组 `converted_user_ids` 的并集。
+- **配对明细不要求是归组那次 visit，也不进组。** u1 的配对是
   `2026-10-07T10:00:00` visit + `10:00:30` signup，而 u1 归在 6 日组：
   归组看"最早合格 visit"，配对看"最早有效 signup 与最晚可配对 visit"
   （归约规则见 `docs/verification-conversion-pairs.md` 与 `:320-344`），
   两条规则独立。每个转化用户恰好一条配对，配对的 `user_id` 集合等于
-  `converted_user_ids`，也等于各日期组转化人数所对应的用户。
+  顶层 `converted_user_ids`，也等于各日期组转化编号的并集。组对象只有
+  六个键——`--include-pairs` 不向组内追加配对字段。
+- **只开分组时维持四键组对象，只开 `--include-users` 时无分组数组。**
+  见第 9 节。
 - **顶层明细与事件记录均不变。** 加 `--group-by` 后三个汇总字段、两个
   编号数组、`conversion_pairs` 的值与不加时一致，仅末尾多出
   `visit_date_groups`；报告对数据库只做 `CREATE TABLE IF NOT EXISTS` 与
@@ -309,18 +372,18 @@ python -m funnel report --db events.sqlite --group-by visit-date \
 
 ## 9. 不变量：行序、重复、重复导入、未启用
 
-以下各条由源码结构保证，并有回归测试佐证（均在本次 16 个通过的用例中）：
+以下各条由源码结构保证，并有回归测试佐证（均在本次 25 个通过的用例中）：
 
 1. **重复事件、重复导入、行序不改变人数。** 归组是
    `GROUP BY user_id` 上的 `MIN` 聚合与集合成员判定
-   （`:350-372`），与物理行序无关；重复事件行（含整批再次导入产生的
+   （`:350-366`），与物理行序无关；重复事件行（含整批再次导入产生的
    相同行）不改变 `MIN`，也不改变 `DISTINCT` 转化集合。回归：
    `test_shuffled_and_duplicate_events_give_same_groups`（固定打乱行序、
    混入两条重复事件，组数值不变）、
    `test_reimport_same_batch_keeps_groups`（同一文件连导两次，组数值
    不变）。
 2. **未启用分组时不输出该数组。** 不传 `--group-by` 时
-   `args.group_by is None`，`:402-403` 不执行，输出只有三个汇总字段。
+   `args.group_by is None`，`:419-420` 不执行，输出只有三个汇总字段。
    回归：`test_no_group_by_leaves_output_unchanged`。**【实测】** 同库
    执行 `python -m funnel report --db events.sqlite --within-seconds 60`
    的完整输出为：
@@ -331,6 +394,17 @@ python -m funnel report --db events.sqlite --group-by visit-date \
 
 3. **启用分组后顶层明细及事件记录不变。** 见第 8 节；分组纯粹是追加。
 4. **无合格访问时数组为空。** 见第 3 节第 10 条及两个空数组测试。
+5. **组内编号对行序、重复事件、重复导入不敏感。** 组内编号来自
+   `date_by_user` 每用户一行的归集（`:372-379`），再经集合去重；
+   打乱行序、混入重复事件或整批重复导入都不改变两个组内数组。回归：
+   `test_group_ids_invariant_under_shuffle_and_duplicates`、
+   `test_group_ids_invariant_under_reimport`。
+6. **只开一个开关时输出字段维持现状。** 只开 `--group-by` 时组对象恰为
+   四个键、顶层无编号数组；只开 `--include-users` 时无 `visit_date_groups`；
+   `--include-pairs` 在任何组合下都不向组内追加字段。回归：
+   `test_group_without_include_users_has_no_id_fields`、
+   `test_include_pairs_does_not_add_pair_fields_to_groups`、
+   `test_no_group_by_leaves_output_unchanged`。
 
 ## 10. 参数与路径错误：退出码 2、标准输出为空
 
@@ -341,7 +415,7 @@ python -m funnel report --db events.sqlite --group-by visit-date \
 
 > 只接受 visit-date（按最早合格 visit 的 UTC 日期分组），得到 '<值>'
 
-它是 argparse 的 `type` 回调，在 `parse_args`（`:467`）阶段触发，因此
+它是 argparse 的 `type` 回调，在 `parse_args`（`:486`）阶段触发，因此
 **先于 `cmd_report`、先于 `os.path.exists`、先于一切数据库访问**：
 退出码 2、标准输出为空、标准错误指出参数名 `--group-by` 与原因，且
 **不创建数据库文件**。测试覆盖的取值：`""`、`"signup-date"`、
@@ -388,16 +462,20 @@ python -m funnel report --db /tmp/fverify/missing.sqlite --group-by visit-date
 ## 11. 验收要点与不变行为
 
 - 验收以三者的对应关系为准：**完整输入**（第 4 节六条 JSONL 逐字节）、
-  **确定输出**（第 5–8 节的导入与报告 JSON、第 10 节的退出码与标准错误
-  形态）、**源码对应**（每条结论标注的 `funnel/__main__.py` 行号与
-  条件）。
+  **确定输出**（第 5–8 节的导入与报告 JSON——含第 6.4 节任务指定的
+  `--group-by visit-date --include-users --within-seconds 60` 验收命令
+  及其组内两数组、第 10 节的退出码与标准错误形态）、**源码对应**（每条
+  结论标注的 `funnel/__main__.py` 行号与条件）。
 - 逐人复核顺序建议：先按第 6.1 节的归组表确认每人的日期，再按第 6.2 节
-  确认谁在转化集合中，最后用第 6.3 节的勾稽（两种人数组和分别等于汇总）
-  对账；需要追事件级证据时叠加第 8 节的两个明细开关。
-- 本文数值分两类标记：**【实测】** 为本机 Python 3.14.4 的实际执行
-  观测；**【源码推导】** 为静态推导并以
-  `tests/test_group_by_visit_date.py` 的具名测试交叉核对（该文件 16 个
+  确认谁在转化集合中，然后用第 6.3 节的勾稽（两种人数组和分别等于汇总）
+  与第 6.4 节的组内编号（两数组长度、子集、并集、不交）对账；需要追
+  事件级证据时叠加第 8 节的配对明细开关。
+- 本文数值分两类标记：**【实测】** 为当前工作树源码在本机（Linux/WSL2）
+  的实际执行观测；**【源码推导】** 为静态推导并以
+  `tests/test_group_by_visit_date.py` 的具名测试交叉核对（该文件 25 个
   用例本次全部通过）。复核时若实际观察与推导冲突，以实际观察为准并修正
   本文。
-- 本次仅交付本说明。程序、README、SQLite 表结构、既有输入输出与其他
-  三份核对说明均保持现状，未新增任何功能。
+- 本次改动只在两开关同开时为日期组**追加** `visit_user_ids` 与
+  `converted_user_ids` 两个数组：顶层汇总、顶层编号数组、配对明细、
+  SQLite 表结构、导入协议均保持现状；只开一个开关时输出字段维持现状，
+  报告始终不改写事件记录。

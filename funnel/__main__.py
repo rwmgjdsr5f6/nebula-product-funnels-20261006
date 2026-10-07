@@ -8,6 +8,7 @@
                               [--include-latency]
                               [--group-by visit-date [--include-group-pairs]
                                                          [--include-group-latency]]
+                              [--output FILE]
 
 仅使用 Python 3 标准库与 SQLite，处理本地虚构用户事件。
 """
@@ -18,6 +19,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime
 
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
@@ -265,6 +267,97 @@ def parse_visit_bound(text):
     return text
 
 
+def parse_output_path(text):
+    """--output 取值校验：必须是非空字符串。
+
+    空白不做裁剪——只由空白组成的取值同样视为空字符串拒绝。空值经
+    argparse 以退出码 2 拒绝（标准错误自带 --output 参数名前缀），且
+    先于一切数据库访问发生。
+    """
+    if text == "":
+        raise argparse.ArgumentTypeError(
+            "必须给出非空的本地文件路径，得到空字符串"
+        )
+    return text
+
+
+def _output_error(output_path, reason):
+    """--output 相关错误的统一出口：退出码 2、标准输出为空，标准错误
+    指出输出路径与原因。"""
+    print("%s: %s" % (output_path, reason), file=sys.stderr)
+    return 2
+
+
+def _prepare_output(output_path, db_path):
+    """--output 的数据库访问前校验，返回 None（通过）或退出码 2。
+
+    - 相对路径按当前工作目录解释：abspath 只补全 cwd，不规范化
+      ``..``/符号链接，与 --db 的系统规则保持同一口径。
+    - 输出路径与 --db 规范化（normcase + abspath）后指向同一绝对
+      路径时提前拒绝，错误信息同时指出两个参数。
+    - 父目录必须已存在（不由程序创建）；目标已存在时必须是普通文件
+      而非目录。
+    所有失败均先于数据库连接发生：不创建数据库、不改动事件记录，
+    也不创建或改写输出文件。
+    """
+    output_abs = os.path.normcase(os.path.abspath(output_path))
+    db_abs = os.path.normcase(os.path.abspath(db_path))
+    if output_abs == db_abs:
+        print(
+            "--output 与 --db 不能指向同一路径：两者规范化后均为 %s"
+            % output_abs,
+            file=sys.stderr,
+        )
+        return 2
+
+    parent = os.path.dirname(output_abs)
+    if not os.path.isdir(parent):
+        return _output_error(output_path, "父目录不存在: %s" % parent)
+    if os.path.isdir(output_abs):
+        return _output_error(output_path, "目标已存在且是目录，不是普通文件")
+    # 既不是目录也不是普通文件（符号链接到目录已被上面的 isdir 拦截；
+    # 残留的非常规文件如 FIFO、设备文件）不允许整体覆盖。
+    if os.path.exists(output_path) and not os.path.isfile(output_path):
+        return _output_error(output_path, "目标已存在但不是普通文件")
+    return None
+
+
+def _write_report_file(output_path, line):
+    """把与标准输出完全相同的一行报告原子地写入 --output 文件。
+
+    UTF-8 编码、内容为单个完整 JSON 对象并以一个 LF 结束；不追加导出
+    时间、路径或其他任何字段。写入采用“同目录临时文件 + os.replace”：
+    先把完整内容（含结尾换行）落到临时文件，替换成功前不触碰目标——
+    已有普通文件在保存失败时保留原内容，目标原本不存在时失败也不
+    留下不完整文件（临时文件在出错时删除）。返回 None 表示成功，
+    否则返回退出码 2（标准输出已先行打印，此处只负责文件与标准错误）。
+    """
+    directory = os.path.dirname(os.path.abspath(output_path)) or "."
+    tmp_path = None
+    try:
+        # delete=False：由本函数显式接管临时文件的收尾，os.replace
+        # 成功后原路径已不存在，清理时忽略 FileNotFoundError。
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=directory, prefix=".funnel-report-", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+            tmp.write(line.encode("utf-8"))
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, output_path)
+    except OSError as exc:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return _output_error(
+            output_path, "报告文件无法写入: %s" % (exc.strerror or exc)
+        )
+    return None
+
+
+
 def _qualifying_visit_date_by_user(conn, visit_where, visit_params):
     """归组查询：返回 {user_id: 最早一次合格 visit 的 UTC 日期}。
 
@@ -468,6 +561,14 @@ def cmd_report(args):
         )
         return 2
 
+    # --output 的路径类校验与其他参数校验一样先于一切数据库访问：
+    # 与 --db 同路径、父目录不存在、目标是目录等情况都直接退出码 2，
+    # 不连接数据库、不创建数据库或输出文件。
+    if args.output is not None:
+        output_rc = _prepare_output(args.output, args.db)
+        if output_rc is not None:
+            return output_rc
+
     if not os.path.exists(args.db):
         print("%s: 数据库不存在" % args.db, file=sys.stderr)
         return 2
@@ -579,7 +680,21 @@ def cmd_report(args):
         payload["conversion_latency"] = conversion_latency
     if args.group_by == "visit-date":
         payload["visit_date_groups"] = visit_date_groups
-    print(json.dumps(payload))
+
+    # 标准输出与文件共用同一条序列化结果：文件内容与本次标准输出解析后
+    # 完全一致，不增加导出时间、路径或其他字段。
+    line = json.dumps(payload)
+
+    if args.output is not None:
+        # 文件先于标准输出落盘：保存失败时退出码 2、标准输出必须为空
+        # （路径类问题已在数据库访问前的 _prepare_output 拦截，这里只
+        # 可能是写入/替换阶段的 OSError）。原子替换保证失败时已有目标
+        # 保留原内容、原本不存在的目标不留下不完整文件。
+        write_rc = _write_report_file(args.output, line + "\n")
+        if write_rc is not None:
+            return write_rc
+
+    print(line)
     return 0
 
 
@@ -671,6 +786,16 @@ def main(argv=None):
         "converted_user_ids，与 --include-group-pairs 合用时各组再追加组内 "
         "conversion_pairs，与 --include-group-latency 合用时各组再追加组内 "
         "conversion_latency；不传则输出不变",
+    )
+    p_report.add_argument(
+        "--output",
+        type=parse_output_path,
+        default=None,
+        metavar="FILE",
+        help="把本次报告 JSON 保存到本地文件（UTF-8，单个 JSON 对象并以换行"
+        "结束，内容与标准输出完全一致，不追加其他字段）；相对路径按当前工作"
+        "目录解释，目标不存在则创建，已存在普通文件则整体覆盖；父目录须事先"
+        "存在。不能与 --db 指向同一路径",
     )
     p_report.set_defaults(func=cmd_report)
 

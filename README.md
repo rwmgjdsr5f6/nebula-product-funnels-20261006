@@ -67,6 +67,16 @@ python -m funnel report --db events.sqlite --group-by visit-date --include-group
 python -m funnel report --db events.sqlite --group-by visit-date --include-group-latency
 ```
 
+把完整报告同时保存到本地 JSON 文件（可选，仅影响本次报告，不改写数据库）：
+
+```sh
+python -m funnel report --db events.sqlite --output report.json
+```
+
+`--output` 后接本地文件路径：相对路径按当前工作目录解释；目标不存在时创建文件，已存在普通文件则整体覆盖（不追加多个报告）；父目录由使用者事先准备，程序不会创建。文件采用 UTF-8 编码，包含一个完整 JSON 对象并以换行结束，解析后的内容与本次标准输出完全一致，不包含导出时间、路径或其他额外字段——访问时段、转化时限、用户编号、配对、耗时与日期分组等全部参数照常合用，保存哪些字段由这些参数共同决定。保存成功时退出码仍为 0，标准输出仍只返回原来的单行报告 JSON，标准错误为空；不传 `--output` 时输出与错误行为保持不变。
+
+`--output` 缺少取值或取空字符串时退出码 2、标准输出为空、标准错误指出 `--output` 及原因，且在数据库访问前拒绝。输出路径与 `--db` 按当前系统规则规范化后得到同一绝对路径时，同样在数据库访问前拒绝，标准错误同时指出 `--output` 与 `--db`。父目录不存在、目标是目录或目标无法写入时退出码 2、标准输出为空、标准错误包含输出路径及原因。参数校验或报告查询失败时不创建或改写输出文件；保存失败时已有目标保留原内容，原本不存在的目标不留下不完整文件。
+
 ## 事件格式
 
 UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
@@ -82,6 +92,7 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 - 导入成功：退出码 0，标准输出仅 `{"imported": N}`（本次有效记录数）
 - 报告成功：退出码 0，标准输出仅 `{"visit_users": V, "converted_users": C, "conversion_rate": R}`；加 `--include-users` 时追加 `"visit_user_ids"` 与 `"converted_user_ids"` 两个字符串数组；加 `--include-pairs` 时追加 `"conversion_pairs"` 配对明细数组；加 `--include-latency` 时在**顶层**追加 `"conversion_latency"` 整体耗时对象（组内是否追加耗时由 `--include-group-latency` 单独控制）；加 `--group-by visit-date` 时追加 `"visit_date_groups"` 分组数组（各开关可合用，分组与编号同开时组对象内再带两个编号数组，分组与 `--include-group-pairs` 同开时组对象内再带配对数组，分组与 `--include-group-latency` 同开时组对象内再带组内 `conversion_latency` 耗时对象，详见统计规则）
 - 输入文件无法读取、数据库无法访问、报告数据库不存在：退出码 2，标准输出为空，标准错误说明路径与原因
+- `--output` 相关失败（缺少取值或空字符串、与 `--db` 同路径、父目录不存在、目标是目录、目标无法写入）：退出码 2，标准输出为空，标准错误指出输出路径（空值等参数错误同时指出 `--output`）与原因；路径类参数错误先于数据库访问，参数校验或报告查询失败时不创建或改写输出文件，保存失败时已有目标保留原内容、原本不存在的目标不留下不完整文件
 
 ## 统计规则
 
@@ -107,3 +118,17 @@ UTF-8 JSONL，每个非空行是一个 JSON 对象，必填字段：
 {"imported": 5}
 {"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333}
 ```
+
+加上 `--output` 把同一份报告存入文件，标准输出仍是上面的单行报告 JSON：
+
+```sh
+python -m funnel report --db events.sqlite --output report.json
+```
+
+`report.json` 为 UTF-8 编码、以换行结束的单个 JSON 对象；解析后与标准输出完全一致：
+
+```json
+{"visit_users": 3, "converted_users": 1, "conversion_rate": 0.3333333333333333}
+```
+
+再次执行同一命令会整体覆盖 `report.json`，不会向其中追加多个报告；配合各明细开关保存的字段随之变化，空报告也可以保存（零值、空数组和 `null` 沿用现有规则）。

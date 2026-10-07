@@ -180,11 +180,24 @@ def parse_within_seconds(text):
     return int(digits)
 
 
-def _visit_window_clause(args):
-    """段内 visit 过滤片段；不提供时间段时为空（全库统计）。"""
-    if args.visit_from is None:
-        return ""
-    return "AND v.timestamp >= ? AND v.timestamp < ?"
+def _visit_filter(args, alias=""):
+    """合格 visit 的 WHERE 子句与绑定参数：段内访问规则的唯一维护点。
+
+    返回 (where_sql, params)。where_sql 恒含 event = 'visit' 条件；提供
+    时段时追加 timestamp >= ? AND timestamp < ?——含起点、不含终点（时间戳
+    为定宽 ISO 文本，字典序比较与时间先后等价）；不传时段则统计全库。
+    alias 非空时为列名加表别名前缀（转化查询的 v）。
+
+    汇总、编号、配对、耗时与日期归组全部经由本函数取得访问资格，段内
+    规则只在此处维护一份，不再由访问统计与转化查询各自平行维护。
+    """
+    prefix = alias + "." if alias else ""
+    conditions = ["%sevent = 'visit'" % prefix]
+    params = ()
+    if args.visit_from is not None:
+        conditions.append("%stimestamp >= ? AND %stimestamp < ?" % (prefix, prefix))
+        params = (args.visit_from, args.visit_before)
+    return "WHERE " + " AND ".join(conditions), params
 
 
 def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
@@ -204,8 +217,8 @@ def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
             " AND CAST(strftime('%s', s.timestamp) AS INTEGER)"
             "\n                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?"
         )
-    sql.append("WHERE v.event = 'visit'")
-    sql.append(_visit_window_clause(args))
+    visit_where, _ = _visit_filter(args, alias="v")
+    sql.append(visit_where)
     return "\n".join(sql)
 
 
@@ -213,8 +226,8 @@ def _converted_params(args):
     params = []
     if args.within_seconds is not None:
         params.append(args.within_seconds)
-    if args.visit_from is not None:
-        params += [args.visit_from, args.visit_before]
+    _, visit_params = _visit_filter(args, alias="v")
+    params += visit_params
     return tuple(params)
 
 
@@ -429,16 +442,11 @@ def cmd_report(args):
         conn = sqlite3.connect(args.db)
         try:
             conn.execute(SCHEMA)
-            if args.visit_from is None:
-                visit_where = "WHERE event = 'visit'"
-                visit_params = ()
-            else:
-                # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
-                # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
-                visit_where = (
-                    "WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?"
-                )
-                visit_params = (args.visit_from, args.visit_before)
+            # 段内访问规则的唯一来源：分母、编号明细与日期归组共用同一份
+            # WHERE 子句与参数（含起点、不含终点；无时段即全库），转化查询
+            # 经 _converted_sql 使用同一来源的带别名版本，段外 visit 既不
+            # 计入访问人数，也不参与转化配对与归组。
+            visit_where, visit_params = _visit_filter(args)
             visit_users = conn.execute(
                 "SELECT COUNT(DISTINCT user_id) FROM events " + visit_where,
                 visit_params,

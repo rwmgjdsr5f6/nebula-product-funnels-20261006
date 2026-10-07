@@ -250,6 +250,63 @@ def parse_visit_bound(text):
     return text
 
 
+def _qualifying_visit_date_by_user(conn, visit_where, visit_params):
+    """归组查询：返回 {user_id: 最早一次合格 visit 的 UTC 日期}。
+
+    只回答"谁归哪天"这一件事：先由 visit_where 应用访问时段过滤
+    （无时段即全库，含起点、不含终点），再按 user_id 取 MIN(timestamp)，
+    段外 visit 不参与归组。时间戳为不含时区后缀的定宽 ISO 文本，统一按
+    UTC 解释，前 10 个字符即日期 YYYY-MM-DD。GROUP BY 保证每人恰好一行，
+    每个用户编号只归一个日期组。
+    """
+    return dict(
+        conn.execute(
+            "SELECT user_id, substr(MIN(timestamp), 1, 10) FROM events "
+            + visit_where
+            + " GROUP BY user_id",
+            visit_params,
+        )
+    )
+
+
+def _build_visit_date_groups(date_by_user, converted_user_ids, include_users):
+    """由归组映射与转化成员集合装配 visit_date_groups。
+
+    这是分组结果唯一的装配点：日期成员关系只存在于 date_by_user，转化
+    成员关系只存在于 converted_user_ids（与汇总同源的集合）；各组人数、
+    比例与（可选的）组内编号数组全部从这两个集合就地派生，不再为同一
+    统计事实平行维护计数与编号集合——人数即成员集合的 len，编号数组即
+    成员集合的 sorted，二者天然勾稽。
+
+    日期按定宽 YYYY-MM-DD 文本升序（字典序即时间先后），只列有合格访问
+    用户的日期、不补空日期；无合格访问时返回空列表。组内转化成员取本组
+    访问成员与转化集合的交集（转化集合本就是合格访问用户的子集，交集同时
+    兜底防止组外编号计入）。比例按本组两种人数真除，分母恒为正。
+    """
+    converted_members = set(converted_user_ids)
+    visit_ids_by_date = {}
+    for user_id, day in date_by_user.items():
+        visit_ids_by_date.setdefault(day, set()).add(user_id)
+
+    groups = []
+    for day in sorted(visit_ids_by_date):
+        visit_ids = visit_ids_by_date[day]
+        converted_ids = visit_ids & converted_members
+        group = {
+            "visit_date": day,
+            "visit_users": len(visit_ids),
+            "converted_users": len(converted_ids),
+            "conversion_rate": len(converted_ids) / len(visit_ids),
+        }
+        if include_users:
+            # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序，与顶层
+            # 编号数组同一口径——区分大小写、保留空白与中文、不按数字大小。
+            group["visit_user_ids"] = sorted(visit_ids)
+            group["converted_user_ids"] = sorted(converted_ids)
+        groups.append(group)
+    return groups
+
+
 def cmd_report(args):
     # 时间段参数必须成对出现且起点严格早于终点。参数校验先于数据库访问：
     # 任何一项不合法都直接退出码 2，不创建数据库、不改动记录。
@@ -343,20 +400,17 @@ def cmd_report(args):
                     for user_id in sorted(best_by_user)
                 ]
             if args.group_by == "visit-date":
-                # 每个用户归到最早合格 visit 的 UTC 日期：先按既有访问时段
-                # 筛选（无时段则全库），再取每人最早的段内 visit；段外历史
-                # 不影响归组，每个用户编号只归一个组。时间戳为定宽 ISO
-                # 文本，前 10 个字符即 UTC 日期（YYYY-MM-DD）。
-                date_by_user = {}
-                for user_id, day in conn.execute(
-                    "SELECT user_id, substr(MIN(timestamp), 1, 10) FROM events "
-                    + visit_where
-                    + " GROUP BY user_id",
-                    visit_params,
-                ):
-                    date_by_user[user_id] = day
-                # 转化判定与汇总完全一致：可使用该用户任意合格访问配对，
-                # 不限于归组用的那次；signup 严格晚于 visit 且允许晚于段终点。
+                # 归组与装配分两步，各自只有一个职责（见两函数文档）：
+                # 1) 每人归最早合格 visit 的 UTC 日期，段外历史不影响归组；
+                # 2) 各组人数、比例与编号数组全部由归组成员与转化成员两个
+                #    集合就地派生。转化集合与汇总完全同源：可使用该用户任意
+                #    合格访问配对（不限于归组那次），signup 严格晚于 visit
+                #    且允许晚于段终点，--within-seconds 上界含等值。
+                # 组内编号数组只在同时启用 --include-users 时追加；
+                # --include-pairs 不向组内追加任何字段。
+                date_by_user = _qualifying_visit_date_by_user(
+                    conn, visit_where, visit_params
+                )
                 converted_id_set = set(
                     row[0]
                     for row in conn.execute(
@@ -364,41 +418,9 @@ def cmd_report(args):
                         _converted_params(args),
                     )
                 )
-                visits_by_date = {}
-                converted_by_date = {}
-                # 组内编号集合：date_by_user 每用户恰一行，直接按归组日期
-                # 归集即可天然去重；转化集合复用上方与汇总同源的
-                # converted_id_set，组内转化用户必在本组访问用户中。
-                visit_ids_by_date = {}
-                converted_ids_by_date = {}
-                for user_id, day in date_by_user.items():
-                    visits_by_date[day] = visits_by_date.get(day, 0) + 1
-                    visit_ids_by_date.setdefault(day, set()).add(user_id)
-                    if user_id in converted_id_set:
-                        converted_by_date[day] = converted_by_date.get(day, 0) + 1
-                        converted_ids_by_date.setdefault(day, set()).add(user_id)
-                # 只列出有访问用户的日期，按日期升序；各组两种人数之和
-                # 分别等于汇总人数。无合格访问时数组为空。组内编号明细只在
-                # 同时启用 --include-users 时追加（排序在 Python 侧进行：
-                # str 比较即 Unicode 码点字典序，与顶层编号数组同一口径）；
-                # --include-pairs 不向组内追加任何字段。
-                visit_date_groups = []
-                for day in sorted(visits_by_date):
-                    group = {
-                        "visit_date": day,
-                        "visit_users": visits_by_date[day],
-                        "converted_users": converted_by_date.get(day, 0),
-                        "conversion_rate": converted_by_date.get(day, 0)
-                        / visits_by_date[day],
-                    }
-                    if args.include_users:
-                        group["visit_user_ids"] = sorted(
-                            visit_ids_by_date[day]
-                        )
-                        group["converted_user_ids"] = sorted(
-                            converted_ids_by_date.get(day, set())
-                        )
-                    visit_date_groups.append(group)
+                visit_date_groups = _build_visit_date_groups(
+                    date_by_user, converted_id_set, args.include_users
+                )
         finally:
             conn.close()
     except sqlite3.Error as exc:

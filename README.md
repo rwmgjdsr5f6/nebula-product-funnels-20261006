@@ -43,6 +43,14 @@ python -m funnel report --db events.sqlite --include-users
 python -m funnel report --db events.sqlite --include-pairs
 ```
 
+在汇总之外追加整体转化耗时统计（可选，不带取值，可单独使用，不依赖 `--include-pairs`，也可与其余开关合用，仅影响本次报告）：
+
+```sh
+python -m funnel report --db events.sqlite --include-latency
+```
+
+顶层追加 `conversion_latency` 对象，仅含 `min_seconds`、`max_seconds`、`mean_seconds` 三项：每个转化用户按"最早有效 signup 配对最晚有效 visit"贡献一个 UTC 整秒耗时，分别取最小、最大与算术平均（前两项为整数，平均值按总耗时除以转化人数真除，不取整）；无转化时三项均为 `null`。日期分组内不追加该统计。
+
 按访问日期分组追加统计（可选，取值目前只接受 `visit-date`，与 `--within-seconds`、`--visit-from/--visit-before`、`--include-users`、`--include-pairs` 可同时使用，仅影响本次报告）：
 
 ```sh

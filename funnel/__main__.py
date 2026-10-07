@@ -180,16 +180,47 @@ def parse_within_seconds(text):
     return int(digits)
 
 
-def _visit_window_clause(args):
-    """段内 visit 过滤片段；不提供时间段时为空（全库统计）。"""
+def _visit_window(args):
+    """访问时段的唯一事实来源：返回半开区间 (起点, 终点) 或 None。
+
+    None 表示不传时段（全库统计）；二元组表示 [起点, 终点)，含起点、
+    不含终点。成对与起点严格早于终点的校验已在 cmd_report 开头完成，
+    这里只需判断其中一个取值。
+    """
     if args.visit_from is None:
-        return ""
-    return "AND v.timestamp >= ? AND v.timestamp < ?"
+        return None
+    return (args.visit_from, args.visit_before)
 
 
-def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
-    """转化查询：visit 必须在段内（如有），signup 只要求严格晚于该次
-    visit，signup 自身可以晚于段终点。select 决定返回人数还是用户编号。"""
+def _visit_filter(window, alias=""):
+    """访问资格条件的唯一样板：event = 'visit' 与段内时间条件始终一起
+    产出，汇总人数、编号明细、转化/配对查询的 visit 侧与日期归组共用这
+    一份片段，不再各自维护段内访问规则。
+
+    window 为 None 时只有事件条件（全库统计）；否则追加
+    "timestamp >= 起点 AND timestamp < 终点"（含起点、不含终点）。alias
+    是列前缀：events 裸表用 ""，自连接的 visit 侧用 "v."。时间戳为定宽
+    ISO 文本，字典序比较与时间先后等价。占位符固定为 [起点, 终点)，
+    绑定参数由 _visit_params 按同一顺序产出。
+    """
+    sql = "%sevent = 'visit'" % alias
+    if window is not None:
+        sql += " AND %stimestamp >= ? AND %stimestamp < ?" % (alias, alias)
+    return sql
+
+
+def _visit_params(window):
+    """与 _visit_filter 的占位符一一对应：无时段时无绑定参数。"""
+    return () if window is None else tuple(window)
+
+
+def _converted_sql(window, within_seconds, select="COUNT(DISTINCT v.user_id)"):
+    """转化/配对查询：visit 一侧必须满足与分母完全相同的访问资格
+    （_visit_filter：visit 事件且在段内，含起点、不含终点；无时段即全
+    库），signup 只要求严格晚于该次 visit，自身可以晚于段终点。
+    within_seconds 非 None 时再要求间隔 <= N 秒（上界含等值）。select
+    决定返回人数、用户编号还是 (user_id, visit_ts, signup_ts) 配对行。
+    """
     sql = [
         "SELECT " + select,
         "FROM events v",
@@ -198,24 +229,23 @@ def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
         " AND s.event = 'signup'",
         " AND s.timestamp > v.timestamp",
     ]
-    if args.within_seconds is not None:
+    if within_seconds is not None:
         # 任一 (visit, signup) 对满足：signup 严格晚于 visit 且间隔 <= N 秒
         sql.append(
             " AND CAST(strftime('%s', s.timestamp) AS INTEGER)"
             "\n                         - CAST(strftime('%s', v.timestamp) AS INTEGER) <= ?"
         )
-    sql.append("WHERE v.event = 'visit'")
-    sql.append(_visit_window_clause(args))
+    sql.append("WHERE " + _visit_filter(window, "v."))
     return "\n".join(sql)
 
 
-def _converted_params(args):
-    params = []
-    if args.within_seconds is not None:
-        params.append(args.within_seconds)
-    if args.visit_from is not None:
-        params += [args.visit_from, args.visit_before]
-    return tuple(params)
+def _converted_params(window, within_seconds):
+    """_converted_sql 的绑定参数：先间隔上界（如启用），再访问时段
+    [起点, 终点)；与 SQL 中占位符的出现顺序一致。"""
+    params = ()
+    if within_seconds is not None:
+        params += (within_seconds,)
+    return params + _visit_params(window)
 
 
 def parse_group_by(text):
@@ -251,21 +281,21 @@ def parse_visit_bound(text):
     return text
 
 
-def _qualifying_visit_date_by_user(conn, visit_where, visit_params):
+def _qualifying_visit_date_by_user(conn, window):
     """归组查询：返回 {user_id: 最早一次合格 visit 的 UTC 日期}。
 
-    只回答"谁归哪天"这一件事：先由 visit_where 应用访问时段过滤
-    （无时段即全库，含起点、不含终点），再按 user_id 取 MIN(timestamp)，
-    段外 visit 不参与归组。时间戳为不含时区后缀的定宽 ISO 文本，统一按
-    UTC 解释，前 10 个字符即日期 YYYY-MM-DD。GROUP BY 保证每人恰好一行，
-    每个用户编号只归一个日期组。
+    只回答"谁归哪天"这一件事：合格 visit 的定义直接取访问资格的唯一
+    样板 _visit_filter（无时段即全库，含起点、不含终点），再按 user_id
+    取 MIN(timestamp)，段外 visit 不参与归组。时间戳为不含时区后缀的
+    定宽 ISO 文本，统一按 UTC 解释，前 10 个字符即日期 YYYY-MM-DD。
+    GROUP BY 保证每人恰好一行，每个用户编号只归一个日期组。
     """
     return dict(
         conn.execute(
-            "SELECT user_id, substr(MIN(timestamp), 1, 10) FROM events "
-            + visit_where
+            "SELECT user_id, substr(MIN(timestamp), 1, 10) FROM events WHERE "
+            + _visit_filter(window)
             + " GROUP BY user_id",
-            visit_params,
+            _visit_params(window),
         )
     )
 
@@ -429,39 +459,38 @@ def cmd_report(args):
         conn = sqlite3.connect(args.db)
         try:
             conn.execute(SCHEMA)
-            if args.visit_from is None:
-                visit_where = "WHERE event = 'visit'"
-                visit_params = ()
-            else:
-                # 段内访问：含起点、不含终点（时间戳为定宽 ISO 文本，可直接按
-                # 字典序比较）；段外 visit 不计入访问人数，也不参与转化配对。
-                visit_where = (
-                    "WHERE event = 'visit' AND timestamp >= ? AND timestamp < ?"
-                )
-                visit_params = (args.visit_from, args.visit_before)
+            # 访问资格只在此解析一次：汇总人数、编号明细、转化/配对查询与
+            # 日期归组全部共用同一 (window, 条件样板, 绑定参数)，段内访问
+            # 规则不再在分母与转化两处平行维护。
+            window = _visit_window(args)
+            visit_filter = _visit_filter(window)
+            visit_params = _visit_params(window)
             visit_users = conn.execute(
-                "SELECT COUNT(DISTINCT user_id) FROM events " + visit_where,
+                "SELECT COUNT(DISTINCT user_id) FROM events WHERE " + visit_filter,
                 visit_params,
             ).fetchone()[0]
             converted_users = conn.execute(
-                _converted_sql(args), _converted_params(args)
+                _converted_sql(window, args.within_seconds),
+                _converted_params(window, args.within_seconds),
             ).fetchone()[0]
             if args.include_users:
-                # 明细沿用与汇总完全相同的筛选条件，按 user_id 原值去重。
-                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序，
-                # 区分大小写、保留空白与中文、不按数字大小排序。
+                # 明细沿用与汇总完全相同的访问资格与配对条件，按 user_id
+                # 原值去重。排序在 Python 侧进行：str 比较即 Unicode 码点
+                # 字典序，区分大小写、保留空白与中文、不按数字大小排序。
                 visit_user_ids = sorted(
                     row[0]
                     for row in conn.execute(
-                        "SELECT DISTINCT user_id FROM events " + visit_where,
+                        "SELECT DISTINCT user_id FROM events WHERE " + visit_filter,
                         visit_params,
                     )
                 )
                 converted_user_ids = sorted(
                     row[0]
                     for row in conn.execute(
-                        _converted_sql(args, "DISTINCT v.user_id"),
-                        _converted_params(args),
+                        _converted_sql(
+                            window, args.within_seconds, "DISTINCT v.user_id"
+                        ),
+                        _converted_params(window, args.within_seconds),
                     )
                 )
             if args.include_pairs or args.include_group_pairs or args.include_latency:
@@ -472,8 +501,12 @@ def cmd_report(args):
                 # 合并排序后也必与顶层数组完全一致。
                 best_by_user = _reduce_pairs(
                     conn.execute(
-                        _converted_sql(args, "v.user_id, v.timestamp, s.timestamp"),
-                        _converted_params(args),
+                        _converted_sql(
+                            window,
+                            args.within_seconds,
+                            "v.user_id, v.timestamp, s.timestamp",
+                        ),
+                        _converted_params(window, args.within_seconds),
                     )
                 )
                 if args.include_pairs:
@@ -484,20 +517,21 @@ def cmd_report(args):
                 # 归组与装配分两步，各自只有一个职责（见两函数文档）：
                 # 1) 每人归最早合格 visit 的 UTC 日期，段外历史不影响归组；
                 # 2) 各组人数、比例与编号数组全部由归组成员与转化成员两个
-                #    集合就地派生。转化集合与汇总完全同源：可使用该用户任意
-                #    合格访问配对（不限于归组那次），signup 严格晚于 visit
-                #    且允许晚于段终点，--within-seconds 上界含等值。
+                #    集合就地派生。转化集合与汇总完全同源、同一份访问资格：
+                #    可使用该用户任意一次合格访问配对（不限于归组那次），
+                #    signup 严格晚于 visit 且允许晚于段终点，
+                #    --within-seconds 上界含等值。
                 # 组内编号数组只在同时启用 --include-users 时追加；
                 # --include-pairs 不向组内追加任何字段，组内配对明细由
                 # --include-group-pairs 单独控制（不自动开启顶层配对）。
-                date_by_user = _qualifying_visit_date_by_user(
-                    conn, visit_where, visit_params
-                )
+                date_by_user = _qualifying_visit_date_by_user(conn, window)
                 converted_id_set = set(
                     row[0]
                     for row in conn.execute(
-                        _converted_sql(args, "DISTINCT v.user_id"),
-                        _converted_params(args),
+                        _converted_sql(
+                            window, args.within_seconds, "DISTINCT v.user_id"
+                        ),
+                        _converted_params(window, args.within_seconds),
                     )
                 )
                 visit_date_groups = _build_visit_date_groups(

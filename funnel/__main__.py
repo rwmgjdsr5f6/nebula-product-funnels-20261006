@@ -209,9 +209,15 @@ def _visit_filter(args, alias=""):
     return "WHERE " + " AND ".join(conditions), params
 
 
-def _converted_sql(args, select="COUNT(DISTINCT v.user_id)"):
+def _converted_sql(args, select="DISTINCT v.user_id"):
     """转化查询：visit 必须在段内（如有），signup 只要求严格晚于该次
-    visit，signup 自身可以晚于段终点。select 决定返回人数还是用户编号。"""
+    visit，signup 自身可以晚于段终点。
+
+    默认 select 为 DISTINCT v.user_id：转化成员的唯一查询形态，汇总人数、
+    编号明细与日期组共用同一份成员集合（见 _converted_members）。配对/耗时
+    明细需要时间戳列时才传 v.user_id, v.timestamp, s.timestamp，沿用完全
+    相同的 FROM/JOIN/WHERE 条件，只是换 select 列表。
+    """
     sql = [
         "SELECT " + select,
         "FROM events v",
@@ -238,6 +244,22 @@ def _converted_params(args):
     _, visit_params = _visit_filter(args, alias="v")
     params += visit_params
     return tuple(params)
+
+
+def _converted_members(conn, args):
+    """转化成员的唯一来源：返回 {user_id}，每个存在至少一次合格转化的
+    用户恰好一个元素（按 user_id 原值去重）。
+
+    整份报告只调用一次：转化人数是这个集合的 len，--include-users 的
+    converted_user_ids 是它的 sorted，日期组用它与组内访问成员取交集——
+    人数、明细与分组不再各自重查同一批转化用户，三者天然勾稽。转化条件
+    （段内 visit、signup 严格晚于 visit 且可晚于段终点、--within-seconds
+    上界含等值）全部在 _converted_sql 的同一条 SQL 里维护。
+    """
+    return {
+        row[0]
+        for row in conn.execute(_converted_sql(args), _converted_params(args))
+    }
 
 
 def parse_group_by(text):
@@ -595,13 +617,16 @@ def cmd_report(args):
                 "SELECT COUNT(DISTINCT user_id) FROM events " + visit_where,
                 visit_params,
             ).fetchone()[0]
-            converted_users = conn.execute(
-                _converted_sql(args), _converted_params(args)
-            ).fetchone()[0]
+            # 转化成员只查这一次：人数、编号明细与日期组共用同一份集合
+            # （见 _converted_members），不再为同一批转化用户分别发人数、
+            # 编号与分组三次查询——人数即集合的 len，三处口径天然一致。
+            converted_members = _converted_members(conn, args)
+            converted_users = len(converted_members)
             if args.include_users:
-                # 明细沿用与汇总完全相同的筛选条件，按 user_id 原值去重。
-                # 排序在 Python 侧进行：str 比较即 Unicode 码点字典序，
-                # 区分大小写、保留空白与中文、不按数字大小排序。
+                # 访问明细沿用与汇总完全相同的筛选条件，按 user_id 原值去重。
+                # 转化明细直接取统一成员集合，不再单独查询；两者排序都在
+                # Python 侧进行：str 比较即 Unicode 码点字典序，区分大小写、
+                # 保留空白与中文、不按数字大小排序。
                 visit_user_ids = sorted(
                     row[0]
                     for row in conn.execute(
@@ -609,13 +634,7 @@ def cmd_report(args):
                         visit_params,
                     )
                 )
-                converted_user_ids = sorted(
-                    row[0]
-                    for row in conn.execute(
-                        _converted_sql(args, "DISTINCT v.user_id"),
-                        _converted_params(args),
-                    )
-                )
+                converted_user_ids = sorted(converted_members)
             if (
                 args.include_pairs
                 or args.include_group_pairs
@@ -641,9 +660,10 @@ def cmd_report(args):
                 # 归组与装配分两步，各自只有一个职责（见两函数文档）：
                 # 1) 每人归最早合格 visit 的 UTC 日期，段外历史不影响归组；
                 # 2) 各组人数、比例与编号数组全部由归组成员与转化成员两个
-                #    集合就地派生。转化集合与汇总完全同源：可使用该用户任意
-                #    合格访问配对（不限于归组那次），signup 严格晚于 visit
-                #    且允许晚于段终点，--within-seconds 上界含等值。
+                #    集合就地派生。转化成员就是汇总人数与编号明细共用的同
+                #    一份集合（仅查询一次）：可使用该用户任意一次合格访问
+                #    配对（不限于归组那次），signup 严格晚于 visit 且允许
+                #    晚于段终点，--within-seconds 上界含等值。
                 # 组内编号数组只在同时启用 --include-users 时追加；
                 # --include-pairs 不向组内追加任何字段，组内配对明细由
                 # --include-group-pairs 单独控制（不自动开启顶层配对），
@@ -652,16 +672,10 @@ def cmd_report(args):
                 date_by_user = _qualifying_visit_date_by_user(
                     conn, visit_where, visit_params
                 )
-                converted_id_set = set(
-                    row[0]
-                    for row in conn.execute(
-                        _converted_sql(args, "DISTINCT v.user_id"),
-                        _converted_params(args),
-                    )
-                )
+                # 转化成员与汇总、编号明细共用同一份集合，不再单独查询。
                 visit_date_groups = _build_visit_date_groups(
                     date_by_user,
-                    converted_id_set,
+                    converted_members,
                     args.include_users,
                     best_by_user if args.include_group_pairs else None,
                     best_by_user if args.include_group_latency else None,

@@ -22,11 +22,15 @@ import sys
 import tempfile
 from datetime import datetime
 
-TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+# 所有数字位显式写成 [0-9] 而不能用 \d：Python 3 的 \d 默认匹配 Unicode
+# 十进制数字（全角２、阿拉伯印度٢ 等），strptime 的 %Y/%m/%d 同样接受它们，
+# 故只有显式 ASCII 字符类才能把非 ASCII 数字挡在形态校验这一关。
+TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 # 报告时间段参数专用：严格锚定首尾，前后空白与末尾 LF 都不接受
 # （TIMESTAMP_RE 的 $ 可匹配末尾 LF 之前的位置，不能直接复用）。
-VISIT_BOUND_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\Z")
+# 数字位同样只用 [0-9]：全角、阿拉伯印度与混排数字一律不接受。
+VISIT_BOUND_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\Z")
 VALID_EVENTS = ("visit", "signup")
 # 严格锚定到完整参数值的首尾：必须使用 \A/\Z 而不是 ^/$——Python 正则中
 # 的 $ 可匹配末尾 LF 之前的位置，^[0-9]+$ 会把 "60\n" 误判为合法值。
@@ -98,7 +102,8 @@ def parse_line(text, line_no):
     if not TIMESTAMP_RE.match(timestamp):
         raise LineError(
             line_no,
-            "timestamp 必须是 YYYY-MM-DDTHH:MM:SS 格式，不接受时区后缀或小数秒",
+            "timestamp 必须是 YYYY-MM-DDTHH:MM:SS 格式，所有数字位只接受 "
+            "ASCII 数字 0-9，不接受全角或其他 Unicode 数字、时区后缀或小数秒",
         )
     try:
         datetime.strptime(timestamp, TIMESTAMP_FORMAT)
@@ -251,13 +256,16 @@ def parse_visit_bound(text):
     """--visit-from / --visit-before 取值校验。
 
     只接受恰好 YYYY-MM-DDTHH:MM:SS 形态的有效日历时间（统一视为 UTC）：
-    不接受前后空白、时区后缀或小数秒；正则只保证形态，strptime 再排除
-    2026-02-30 这类形态合法但日历无效的日期。校验失败经 argparse 以退出
-    码 2 拒绝（标准错误自带参数名前缀），且先于一切数据库访问发生。
+    所有数字位只接受 ASCII 数字 0-9（全角、阿拉伯印度等 Unicode 数字及
+    混排一律拒绝，不做转换、裁剪或补零）；不接受前后空白、时区后缀或
+    小数秒；正则只保证形态，strptime 再排除 2026-02-30 这类形态合法但
+    日历无效的日期。校验失败经 argparse 以退出码 2 拒绝（标准错误自带
+    参数名前缀），且先于一切数据库访问发生。
     """
     if not VISIT_BOUND_RE.match(text):
         raise argparse.ArgumentTypeError(
-            "必须是 YYYY-MM-DDTHH:MM:SS 格式（UTC，不含空白、时区后缀或小数秒），得到 %r"
+            "必须是 YYYY-MM-DDTHH:MM:SS 格式（UTC，数字位只接受 ASCII 0-9，"
+            "不含空白、Unicode 数字、时区后缀或小数秒），得到 %r"
             % text
         )
     try:

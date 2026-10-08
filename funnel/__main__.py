@@ -22,11 +22,15 @@ import sys
 import tempfile
 from datetime import datetime
 
-TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+# 数字位置显式写成 [0-9] 而不是 \d：Python 正则的 \d 匹配 Unicode 十进
+# 制数字（全角 ２０２６、阿拉伯印度数字 ٢٠٢٦ 都会通过，strptime 的 %Y
+# 同样接受它们），但这些值不得入库或成为访问边界，故只接受 ASCII 0-9。
+TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 # 报告时间段参数专用：严格锚定首尾，前后空白与末尾 LF 都不接受
 # （TIMESTAMP_RE 的 $ 可匹配末尾 LF 之前的位置，不能直接复用）。
-VISIT_BOUND_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\Z")
+# 数字位置同样只用 [0-9]：拒绝全角、阿拉伯印度等一切非 ASCII 数字。
+VISIT_BOUND_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\Z")
 VALID_EVENTS = ("visit", "signup")
 # 严格锚定到完整参数值的首尾：必须使用 \A/\Z 而不是 ^/$——Python 正则中
 # 的 $ 可匹配末尾 LF 之前的位置，^[0-9]+$ 会把 "60\n" 误判为合法值。
@@ -98,7 +102,9 @@ def parse_line(text, line_no):
     if not TIMESTAMP_RE.match(timestamp):
         raise LineError(
             line_no,
-            "timestamp 必须是 YYYY-MM-DDTHH:MM:SS 格式，不接受时区后缀或小数秒",
+            "timestamp 必须是 YYYY-MM-DDTHH:MM:SS 格式，所有数字位置只接受 "
+            "ASCII 0 到 9：不接受时区后缀或小数秒，也不接受全角数字、阿拉伯"
+            "印度数字等非 ASCII 数字（不自动转换、裁剪或补零）",
         )
     try:
         datetime.strptime(timestamp, TIMESTAMP_FORMAT)
@@ -251,14 +257,17 @@ def parse_visit_bound(text):
     """--visit-from / --visit-before 取值校验。
 
     只接受恰好 YYYY-MM-DDTHH:MM:SS 形态的有效日历时间（统一视为 UTC）：
-    不接受前后空白、时区后缀或小数秒；正则只保证形态，strptime 再排除
-    2026-02-30 这类形态合法但日历无效的日期。校验失败经 argparse 以退出
-    码 2 拒绝（标准错误自带参数名前缀），且先于一切数据库访问发生。
+    不接受前后空白、时区后缀或小数秒；所有数字位置只接受 ASCII 0 到 9，
+    全角数字、阿拉伯印度数字等非 ASCII 数字（含混排）一律拒绝，不自动
+    转换、裁剪或补零。正则只保证形态，strptime 再排除 2026-02-30 这类
+    形态合法但日历无效的日期。校验失败经 argparse 以退出码 2 拒绝
+    （标准错误自带参数名前缀），且先于一切数据库访问发生。
     """
     if not VISIT_BOUND_RE.match(text):
         raise argparse.ArgumentTypeError(
-            "必须是 YYYY-MM-DDTHH:MM:SS 格式（UTC，不含空白、时区后缀或小数秒），得到 %r"
-            % text
+            "必须是 YYYY-MM-DDTHH:MM:SS 格式（UTC，所有数字位置只接受 "
+            "ASCII 0 到 9，不含空白、时区后缀或小数秒；不接受全角数字、"
+            "阿拉伯印度数字等非 ASCII 数字），得到 %r" % text
         )
     try:
         datetime.strptime(text, TIMESTAMP_FORMAT)
